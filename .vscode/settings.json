@@ -1,0 +1,13 @@
+{
+  "C_Cpp.default.configurationName": "Linux kernel module - current",
+  "C_Cpp.errorSquiggles": "enabled",
+  "files.associations": {
+    "*.h": "c",
+    "*.c": "c",
+    "Kbuild": "makefile"
+  },
+  "files.exclude": {
+    ".gdb": true,
+    "build": true
+  }
+}

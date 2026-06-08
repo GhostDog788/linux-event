@@ -1,0 +1,70 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "kernelTarget",
+      "type": "promptString",
+      "description": "Target profile (one of the names in TARGETS in lab.local.env)",
+      "default": "server"
+    },
+    {
+      "id": "debugMethod",
+      "type": "pickString",
+      "description": "Debug method",
+      "options": [
+        "kgdb",
+        "qemu"
+      ],
+      "default": "qemu"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Kernel: Check Target",
+      "type": "shell",
+      "command": "./scripts/00-check-target.sh ${input:kernelTarget} ${input:debugMethod}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Kernel: Provision Target",
+      "type": "shell",
+      "command": "./scripts/01-provision-target.sh ${input:kernelTarget} ${input:debugMethod}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Kernel: Setup Host Build",
+      "type": "shell",
+      "command": "./scripts/02-setup-host-build.sh ${input:kernelTarget}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Kernel: Build",
+      "type": "shell",
+      "command": "./scripts/03-build-module.sh ${input:kernelTarget}",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Kernel: Deploy + Prep GDB",
+      "type": "shell",
+      "command": "./scripts/04-deploy-and-prep-gdb.sh ${input:kernelTarget} ${input:debugMethod}",
+      "problemMatcher": []
+    },
+    {
+      "label": "Kernel: GDB",
+      "type": "shell",
+      "command": "./scripts/04-deploy-and-prep-gdb.sh ${input:kernelTarget} ${input:debugMethod} && gdb -tui ${workspaceFolder}/.gdb/current-vmlinux -x ${workspaceFolder}/.gdb/current-debug.gdb",
+      "presentation": {
+        "echo": false,
+        "reveal": "always",
+        "focus": true,
+        "panel": "dedicated",
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}
