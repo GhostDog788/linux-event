@@ -9,6 +9,7 @@ kernel-cache/
 
 # Per-target build intermediates and final .ko artifacts.
 build/
+code/example/demo
 
 # Kbuild stragglers in case anything runs out of place.
 *.ko

@@ -113,10 +113,20 @@ lab_load_target() {
 	# ConnectTimeout: fail fast on dead targets instead of multi-minute TCP wait.
 	# ServerAliveInterval: keep long-lived connections (e.g. the polling loop)
 	# alive through NAT idle timers.
+	# ControlMaster: multiplex every ssh/scp/rsync for a target over ONE
+	# connection. The first connection authenticates (so password-auth targets
+	# prompt exactly once instead of once per command, which otherwise breaks
+	# scripts that make several connections in a row); the rest reuse it. The
+	# socket persists briefly so back-to-back script runs stay authenticated.
+	# %C hashes user/host/port into a short, per-target, collision-free name.
+	local cm_path="${TMPDIR:-/tmp}/lab-ssh-cm-%C"
 	local ssh_opts=(
 		-o StrictHostKeyChecking=accept-new
 		-o ConnectTimeout=10
 		-o ServerAliveInterval=15
+		-o ControlMaster=auto
+		-o "ControlPath=$cm_path"
+		-o ControlPersist=120
 	)
 	LAB_SSH_CMD=("$ssh_bin" "${ssh_opts[@]}" -p "$LAB_SSH_PORT")
 	LAB_SCP_CMD=("$scp_bin" "${ssh_opts[@]}" -P "$LAB_SSH_PORT")
