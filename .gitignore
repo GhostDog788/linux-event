@@ -10,6 +10,11 @@ kernel-cache/
 # Per-target build intermediates and final .ko artifacts.
 build/
 code/example/demo
+code/bench/bench
+
+# Benchmark CSVs fetched by scripts/06-bench.sh (commit one deliberately if
+# you want to keep a baseline around).
+results/
 
 # Kbuild stragglers in case anything runs out of place.
 *.ko

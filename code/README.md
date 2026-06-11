@@ -37,6 +37,10 @@ code/
 ├── example/         a runnable demo: many listeners, one sender
 │   ├── demo.c           forks N listeners that all block on one event
 │   └── Makefile
+├── bench/           the performance yardstick for implementation iterations
+│   ├── bench.c          wake-latency / fan-out / throughput harness (+ futex control)
+│   ├── compare.py       statistical A/B verdict between two bench runs
+│   └── README.md        methodology + the comparison protocol
 └── README.md        this file
 ```
 
@@ -164,6 +168,23 @@ NAT'd VM with no extra port-forwarding. Knobs (env vars read by
 The debugger follows the **sender** (the parent) by default — that's the path
 that calls `signal_event()`. The listeners are forked children; to break inside
 one, run `set follow-fork-mode child` in the Debug Console before continuing.
+
+## Benchmarking an implementation iteration
+
+The implementation in `module/event.c` is meant to be iterated on. Whether an
+iteration is actually *better* — and in which regime (single waiter, large
+fan-out, high churn) — is decided by the benchmark in [`bench/`](bench/), not
+by eyeballing:
+
+```bash
+scripts/06-bench.sh server          # run on the target, CSV lands in results/
+# ...change event.c, rebuild (scripts/03) and reload (scripts/04), rerun...
+python3 code/bench/compare.py results/<baseline>.csv results/<candidate>.csv
+```
+
+`compare.py` prints per-metric medians/p99s with a significance test, and a
+built-in futex baseline acts as a control that catches noisy runs. The full
+protocol and what each metric means live in [`bench/README.md`](bench/README.md).
 
 ## What changed from the original design
 
