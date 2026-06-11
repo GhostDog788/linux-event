@@ -179,6 +179,20 @@ Why this is safe without a lock:
   (The same argument the kernel's `rcuwait` relies on; earlier iterations
   paid a `get/put_task_struct` pair per node instead, which dominated large
   fan-outs.)
+- **Cancellation-free fast walks.** The per-node atomic in the signal walk
+  exists only to tell live waiters from cancelled ones, yet cancellations
+  are rare. The event counts cancellations *outstanding* (begun but not yet
+  reaped): while that count is zero, the walk takes a fast path of plain
+  release stores and unconditional wakes, no per-node atomics at all. The
+  race with a cancel beginning mid-walk is closed by a handshake: a fast
+  walk raises an in-flight counter before reading the cancel count, and a
+  canceller announces itself first, marks its node, then waits out any
+  in-flight fast walks; if one blindly signaled it meanwhile, the cancel
+  converts into a normal signaled return (safe: that waiter is alive, it
+  was spinning right here). Careful walks reap abandoned nodes through an
+  RCU-deferred free (state `EV_REAPED`), so a looking canceller can never
+  read freed memory, and the count returns to zero, re-enabling the fast
+  path even for timeout-heavy users.
 
 The cost of going lock-free: nodes are slab-allocated per wait rather than
 living on the waiter's stack (an interrupted waiter must be able to leave

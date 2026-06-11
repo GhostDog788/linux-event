@@ -30,6 +30,7 @@ enum subscriber_state {
 	EV_WAITING,
 	EV_SIGNALED,  /* signaler wakes the waiter; the waiter frees */
 	EV_CANCELLED, /* waiter left early; the next signal/release frees */
+	EV_REAPED,    /* abandoned node claimed by a walk; freed via RCU */
 };
 
 /*
@@ -42,21 +43,62 @@ struct subscriber {
 	struct subscriber *next;
 	struct task_struct *task;
 	unsigned int state;
+	struct rcu_head rcu;
 };
 
 struct event {
 	struct subscriber *head; /* lock-free LIFO: cmpxchg push, xchg take-all */
 	atomic64_t gen;		 /* signal count */
+	atomic_t cancels;	 /* cancellations outstanding; 0 enables the
+				  * fast signal walk (see README) */
+	atomic_t fast_walks;	 /* fast walks in flight */
 };
 
 static struct kmem_cache *subscriber_cache;
 
-/* True: the node is now abandoned (EV_CANCELLED) for a later signal or
- * release to free; the caller must not touch it again. False: a signaler
- * got there first; we are signaled and the node is ours. */
-static bool subscriber_cancel(struct subscriber *sub)
+static void subscriber_free_rcu(struct rcu_head *rcu)
 {
-	return cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) == EV_WAITING;
+	kmem_cache_free(subscriber_cache,
+			container_of(rcu, struct subscriber, rcu));
+}
+
+/*
+ * True: the cancel stands and the node is no longer ours (abandoned in
+ * place, or already reaped by a walk). False: a signal won the race; the
+ * caller is signaled and the node, marked EV_SIGNALED, is ours to free.
+ */
+static bool subscriber_cancel(struct event *evt, struct subscriber *sub)
+{
+	unsigned int s;
+
+	/* Announce before marking: a signal walk either sees the count and
+	 * takes the careful path, or is already in flight and waited out
+	 * below. */
+	atomic_inc(&evt->cancels);
+	smp_mb__after_atomic();
+
+	if (cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) != EV_WAITING) {
+		atomic_dec(&evt->cancels);
+		return false;
+	}
+
+	/* Fast walks blindly signal every node, so wait out any that began
+	 * before our announcement was visible (bounded: no new one can
+	 * start), then look at what happened. RCU keeps the node readable
+	 * even if a careful walk reaps it meanwhile. */
+	rcu_read_lock();
+	while (atomic_read_acquire(&evt->fast_walks))
+		cpu_relax();
+	s = smp_load_acquire(&sub->state);
+	rcu_read_unlock();
+
+	if (s == EV_SIGNALED) {
+		atomic_dec(&evt->cancels);
+		return false;
+	}
+	/* EV_CANCELLED: abandoned, counted until a walk reaps it.
+	 * EV_REAPED: a walk already freed it and dropped the count. */
+	return true;
 }
 
 static int event_open(struct inode *inode, struct file *file)
@@ -133,13 +175,13 @@ static int do_wait(struct event *evt, struct event_wait *w)
 		/* A signal claimed the list before our push: it will never
 		 * wake us, but the caller must see it. */
 		if ((u64)atomic64_read(&evt->gen) != w->gen) {
-			if (subscriber_cancel(sub))
+			if (subscriber_cancel(evt, sub))
 				sub = NULL;
 			break;
 		}
 
 		if (signal_pending(current)) {
-			if (subscriber_cancel(sub)) {
+			if (subscriber_cancel(evt, sub)) {
 				ret = -ERESTARTSYS;
 				sub = NULL;
 			}
@@ -153,7 +195,7 @@ static int do_wait(struct event *evt, struct event_wait *w)
 			/* Deadline passed; a signal racing it wins. */
 			if (smp_load_acquire(&sub->state) == EV_SIGNALED)
 				break;
-			if (subscriber_cancel(sub)) {
+			if (subscriber_cancel(evt, sub)) {
 				ret = -ETIMEDOUT;
 				sub = NULL;
 			}
@@ -176,6 +218,7 @@ static int signal_event(struct event *evt)
 {
 	struct subscriber *sub, *next;
 	int woken = 0;
+	bool fast;
 
 	/* Counted before anyone can observe the wake (the ordered RMW
 	 * traffic below propagates it), so late waiters always catch up. */
@@ -184,6 +227,16 @@ static int signal_event(struct event *evt)
 	/* Nobody waiting: a plain read spares the cacheline an xchg. */
 	if (!READ_ONCE(evt->head))
 		return 0;
+
+	/* With no cancellation outstanding, every claimed node is a live
+	 * parked waiter and the walk needs no per-node atomics. Announce
+	 * the fast walk before checking, so a cancel this check misses is
+	 * guaranteed to see it and wait for us (see subscriber_cancel). */
+	atomic_inc(&evt->fast_walks);
+	smp_mb__after_atomic();
+	fast = atomic_read(&evt->cancels) == 0;
+	if (!fast)
+		atomic_dec(&evt->fast_walks);
 
 	/* Take-all: every claimed node now belongs to this call alone. */
 	sub = xchg(&evt->head, NULL);
@@ -196,16 +249,32 @@ static int signal_event(struct event *evt)
 		 * read everything first. */
 		next = sub->next;
 
-		if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
+		if (fast) {
+			smp_store_release(&sub->state, EV_SIGNALED);
+			wake_up_process(task);
+			woken++;
+		} else if (cmpxchg(&sub->state, EV_WAITING, EV_SIGNALED) ==
+			   EV_WAITING) {
 			wake_up_process(task);
 			woken++;
 		} else {
-			kmem_cache_free(subscriber_cache, sub); /* abandoned */
+			/* EV_CANCELLED: reap the abandoned node. RCU defers
+			 * the free past any canceller still looking at it. */
+			smp_store_release(&sub->state, EV_REAPED);
+			call_rcu(&sub->rcu, subscriber_free_rcu);
+			atomic_dec(&evt->cancels);
 		}
 
 		sub = next;
 	}
 	rcu_read_unlock();
+
+	if (fast) {
+		/* Order the stores above before releasing any canceller
+		 * spinning on the in-flight count. */
+		smp_mb__before_atomic();
+		atomic_dec(&evt->fast_walks);
+	}
 
 	return woken;
 }
@@ -273,6 +342,7 @@ static int __init event_init(void)
 static void __exit event_exit(void)
 {
 	misc_deregister(&event_misc);
+	rcu_barrier(); /* flush pending subscriber_free_rcu callbacks */
 	kmem_cache_destroy(subscriber_cache);
 	pr_info("event: unloaded\n");
 }
@@ -283,4 +353,4 @@ module_exit(event_exit);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
 MODULE_DESCRIPTION("Minimal event synchronization object (/dev/event)");
-MODULE_VERSION("4.1");
+MODULE_VERSION("5.0");
