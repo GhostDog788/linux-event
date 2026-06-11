@@ -2,9 +2,22 @@
 /*
  * event_uapi.h - the ioctl ABI shared between event.ko and userspace.
  *
- * The userspace library (../lib/event.h) defines the *same* constants so it can
- * stay standalone/header-only. If you change the magic or command numbers here,
- * change them there too -- the two must match exactly.
+ * The userspace library (../lib/event.h) defines the *same* constants so it
+ * can stay standalone/header-only. If you change anything here, change it
+ * there too -- the two must match exactly.
+ *
+ * The whole ABI is one wait and one signal:
+ *
+ *  - Every EVENT_IOC_SIGNAL bumps the event's generation counter (starting
+ *    from 0 at creation) and wakes every waiter.
+ *
+ *  - EVENT_IOC_WAIT takes the generation the caller last observed. If the
+ *    event has been signaled since, it returns immediately; otherwise it
+ *    blocks until the next signal or until timeout_ms expires. The current
+ *    generation is written back on success, ready for the next call -- so a
+ *    wait/work/re-arm loop observes every signal, no matter how late it
+ *    re-arms (a burst during one stretch of work coalesces into one return,
+ *    with the generation jumped by the burst size).
  */
 #ifndef EVENT_UAPI_H
 #define EVENT_UAPI_H
@@ -12,43 +25,17 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define EVENT_IOC_MAGIC 'E'
-
-/* Block the calling thread until the event is signaled. Edge-triggered: a
- * signal fired before this call is not seen (see EVENT_IOC_WAIT_GEN). */
-#define EVENT_IOC_WAIT _IO(EVENT_IOC_MAGIC, 1)
-
-/* Wake every thread currently waiting on the event. */
-#define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
-
-/*
- * Generation-aware wait: arg is a __u64 * holding the last signal generation
- * this caller observed (0 = never; the counter starts at 0 and each
- * signal_event() increments it). If the event has been signaled since, the
- * call returns 0 immediately; otherwise it blocks until the next signal.
- * Either way the current generation is written back through arg, ready for
- * the next call -- so a caller that loops on this can never miss a signal,
- * no matter how late it re-arms.
- */
-#define EVENT_IOC_WAIT_GEN _IOWR(EVENT_IOC_MAGIC, 3, __u64)
-
-/*
- * Extended wait: generation awareness and/or a timeout, in one call.
- *
- * timeout_ms < 0 waits forever; 0 polls (returns -ETIMEDOUT immediately if
- * the event is not pending); > 0 waits at most that many milliseconds and
- * fails with -ETIMEDOUT if no signal arrived. gen is honored (and written
- * back) only when EVENT_WAIT_FL_GEN is set in flags; reserved must be 0.
- */
 struct event_wait {
-	__u64 gen;	  /* in/out: last seen generation (with FL_GEN) */
-	__s64 timeout_ms; /* in: < 0 = forever, 0 = poll */
-	__u32 flags;	  /* in: EVENT_WAIT_FL_* */
-	__u32 reserved;	  /* in: must be 0 */
+	__u64 gen;	  /* in: last seen generation; out: current */
+	__s64 timeout_ms; /* in: < 0 = wait forever, 0 = poll */
 };
 
-#define EVENT_WAIT_FL_GEN 0x1u
+#define EVENT_IOC_MAGIC 'E'
 
-#define EVENT_IOC_WAIT_EX _IOWR(EVENT_IOC_MAGIC, 4, struct event_wait)
+/* Block until the event is signaled past ->gen; -ETIMEDOUT on expiry. */
+#define EVENT_IOC_WAIT _IOWR(EVENT_IOC_MAGIC, 1, struct event_wait)
+
+/* Wake every thread currently waiting; returns the number woken. */
+#define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
 
 #endif /* EVENT_UAPI_H */

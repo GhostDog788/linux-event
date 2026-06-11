@@ -57,8 +57,8 @@ Rules that make the result definitive rather than anecdotal:
 | `churn` | `wakes_per_sec` | sustained subscribers-woken throughput with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
 | `churn` | `empty_signal_pct` | how often the publisher found nobody parked | diagnostic: high % = waiters re-arm slower than the publisher signals |
 | `churn` | `waiter_wakes` | per-waiter wake counts | fairness: one starved waiter shows up as a low outlier |
-| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; uses the generation API, so set `-P`/`-W` to your real workload's numbers |
-| `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced by the gen API) | if this is nonzero, the plain edge-triggered wait would have silently *lost* these events — a correctness number, not just a performance one |
+| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"** — set `-P`/`-W` to your real workload's numbers |
+| `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced into its next wait's generation jump) | listeners running behind the publisher; an edge-triggered design would silently *lose* these events |
 | `signal0` | `signal0_ns` | signal cost with zero subscribers | events that are mostly idle ("publish and nobody listens") |
 | `open` | `open_close_ns` | create + destroy cost | short-lived events created per request |
 
@@ -70,9 +70,10 @@ sweep (`-N`) shows where the crossover sits.
 
 ## How the harness keeps rounds honest
 
-The event is edge-triggered: a waiter that is not yet registered when the
-signal fires misses it. A naive bench would race and silently measure
-garbage. Each `wake` round therefore:
+A `wake` round only measures wake-up latency if every waiter is actually
+parked in the kernel before the signal — a waiter that returned instantly
+off the generation counter measures nothing, and a naive bench would race
+and silently mix the two. Each round therefore:
 
 1. waits for every waiter to announce readiness (userspace atomic),
 2. polls `/proc/self/task/<tid>/stat` until every waiter thread is in state
@@ -99,11 +100,11 @@ Other choices worth knowing:
 - The first `max(3, rounds/10)` rounds per combination are warmup and
   discarded.
 - In `churn`, throughput is counted publisher-side from the signal's return
-  value ("parked waiters woken per second"). The futex control's per-waiter
-  counts run higher than that because a waiter that observes the generation
-  bump before parking never sleeps (EAGAIN) — its deliveries don't appear in
-  `FUTEX_WAKE`'s return. Compare `wakes_per_sec` across implementations;
-  treat `waiter_wakes` as a fairness signal within one implementation.
+  value ("parked waiters woken per second"). Per-waiter counts can run
+  higher than that because a waiter that observes the generation move before
+  parking never sleeps — its deliveries don't appear in the signal's return.
+  Compare `wakes_per_sec` across implementations; treat `waiter_wakes` as a
+  fairness signal within one implementation.
 - `-p <cpu>` pins the publisher for steadier `signal_call_ns` numbers; use it
   consistently on both sides of a comparison or not at all.
 

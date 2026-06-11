@@ -3,18 +3,29 @@
  * event.h - header-only userspace API for the event.ko synchronization object.
  *
  * Include this header and link nothing: every entry point is a `static inline`
- * wrapper around open()/ioctl()/close() on the /dev/event character device that
- * event.ko exposes.
+ * wrapper around open()/ioctl()/close() on the /dev/event character device
+ * that event.ko exposes.
  *
  *     #include "event.h"
  *
- *     int evt = create_event();        // a fresh event object (an fd)
- *     ...
- *     wait_for_event(evt);             // subscriber: block until signaled
- *     ...
- *     signal_event(evt);               // publisher: wake all subscribers
- *     ...
- *     close_event(evt);                // destroy the event
+ *     int evt = create_event();              // a fresh event object (an fd)
+ *     uint64_t gen = 0;                      // "I have seen no signals yet"
+ *
+ *     // subscriber loop: never misses a signal, no matter how long the
+ *     // work takes -- signals fired meanwhile return immediately.
+ *     for (;;) {
+ *             wait_for_event(evt, &gen);     // block until signaled past gen
+ *             do_work();
+ *     }
+ *
+ *     signal_event(evt);                     // publisher: wake all subscribers
+ *     close_event(evt);                      // destroy the event
+ *
+ * Every signal bumps the event's generation counter (from 0 at creation);
+ * a wait returns as soon as the event has been signaled past the caller's
+ * generation and writes the current one back. A burst of signals during one
+ * stretch of work coalesces into one return -- check how far *gen jumped if
+ * you care how many fired.
  *
  * Because an event *is* an open fd, fork() shares it: open the event in the
  * parent, fork your listeners, and parent + children all reference the same
@@ -37,24 +48,17 @@ extern "C" {
 
 #define EVENT_DEVICE "/dev/event"
 
-#define EVENT_IOC_MAGIC 'E'
-#define EVENT_IOC_WAIT _IO(EVENT_IOC_MAGIC, 1)
-#define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
-#define EVENT_IOC_WAIT_GEN _IOWR(EVENT_IOC_MAGIC, 3, uint64_t)
-
-/* Must match struct event_wait in ../module/event_uapi.h exactly. */
+/* Must match ../module/event_uapi.h exactly. */
 struct event_wait {
 	uint64_t gen;
 	int64_t timeout_ms;
-	uint32_t flags;
-	uint32_t reserved;
 };
 
-#define EVENT_WAIT_FL_GEN 0x1u
+#define EVENT_IOC_MAGIC 'E'
+#define EVENT_IOC_WAIT _IOWR(EVENT_IOC_MAGIC, 1, struct event_wait)
+#define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
 
-#define EVENT_IOC_WAIT_EX _IOWR(EVENT_IOC_MAGIC, 4, struct event_wait)
-
-/* Timeout values and results for the *_timeout waits (see the design doc). */
+/* Timeout values and results for wait_for_event_timeout(). */
 #define EVT_WAIT_FOREVER (-1)
 #define EVT_WAIT_ZERO 0
 #define EVT_SIGNALED 0
@@ -63,9 +67,9 @@ struct event_wait {
 /*
  * create_event(): allocate a new event object in the kernel.
  *
- * Returns an fd referring to the event, or -1 with errno set (the usual open()
- * failure modes; ENOENT/EACCES if event.ko is not loaded or /dev/event is not
- * accessible).
+ * Returns an fd referring to the event, or -1 with errno set (the usual
+ * open() failure modes; ENOENT/EACCES if event.ko is not loaded or
+ * /dev/event is not accessible).
  */
 static inline int create_event(void)
 {
@@ -73,36 +77,22 @@ static inline int create_event(void)
 }
 
 /*
- * wait_for_event(): register the calling thread as a subscriber and block,
- * consuming no CPU, until the event is signaled.
+ * wait_for_event(): block, consuming no CPU, until the event is signaled
+ * past *gen -- returning immediately if it already has been. Start with
+ * *gen = 0; on success *gen holds the current generation, ready for the
+ * next call.
  *
- * Returns 0 on a normal wake, or -1 with errno set (EINTR if a signal
- * interrupted the wait).
+ * Returns 0 on signal (with *gen updated), or -1 with errno set (EINTR if
+ * a POSIX signal interrupted the wait).
  */
-static inline int wait_for_event(int evt)
+static inline int wait_for_event(int evt, uint64_t *gen)
 {
-	return ioctl(evt, EVENT_IOC_WAIT);
-}
+	struct event_wait w = { .gen = *gen, .timeout_ms = EVT_WAIT_FOREVER };
 
-/*
- * wait_for_event_gen(): like wait_for_event(), but immune to missed signals.
- *
- * The plain wait is edge-triggered: a signal that fires while you are off
- * doing work (not yet re-registered) is lost. This variant closes that gap
- * with a generation counter: *gen carries the last signal generation this
- * caller observed -- start with 0 ("never saw a signal"). If the event has
- * been signaled since, the call returns immediately; otherwise it blocks
- * until the next signal. On success *gen is updated, ready for the next
- * call, so a wait/work/re-arm loop sees every signal exactly once (a burst
- * of signals during one stretch of work coalesces into one return -- check
- * how far *gen jumped if you care how many fired).
- *
- * Returns 0 on signal (with *gen updated), or -1 with errno set (EINTR if a
- * signal interrupted the wait).
- */
-static inline int wait_for_event_gen(int evt, uint64_t *gen)
-{
-	return ioctl(evt, EVENT_IOC_WAIT_GEN, gen);
+	if (ioctl(evt, EVENT_IOC_WAIT, &w) != 0)
+		return -1;
+	*gen = w.gen;
+	return 0;
 }
 
 /*
@@ -111,31 +101,16 @@ static inline int wait_for_event_gen(int evt, uint64_t *gen)
  * @timeout_ms: milliseconds to wait. EVT_WAIT_FOREVER (-1) never times out;
  * EVT_WAIT_ZERO (0) returns immediately (a poll).
  *
- * Returns EVT_SIGNALED when the event fired within the limit, EVT_TIMEOUT
- * when it did not, or -1 with errno set (EINTR if a signal interrupted).
+ * Returns EVT_SIGNALED when the event fired within the limit (with *gen
+ * updated), EVT_TIMEOUT when it did not (*gen untouched), or -1 with errno
+ * set (EINTR if a POSIX signal interrupted the wait).
  */
-static inline int wait_for_event_timeout(int evt, int64_t timeout_ms)
+static inline int wait_for_event_timeout(int evt, uint64_t *gen,
+					 int64_t timeout_ms)
 {
-	struct event_wait w = { .timeout_ms = timeout_ms };
+	struct event_wait w = { .gen = *gen, .timeout_ms = timeout_ms };
 
-	if (ioctl(evt, EVENT_IOC_WAIT_EX, &w) == 0)
-		return EVT_SIGNALED;
-	return errno == ETIMEDOUT ? EVT_TIMEOUT : -1;
-}
-
-/*
- * wait_for_event_gen_timeout(): the generation-aware wait, bounded in time.
- * Combines wait_for_event_gen() (no missed signals across a re-arm loop)
- * with the timeout semantics above. *gen is updated on EVT_SIGNALED.
- */
-static inline int wait_for_event_gen_timeout(int evt, uint64_t *gen,
-					     int64_t timeout_ms)
-{
-	struct event_wait w = { .gen = *gen,
-				.timeout_ms = timeout_ms,
-				.flags = EVENT_WAIT_FL_GEN };
-
-	if (ioctl(evt, EVENT_IOC_WAIT_EX, &w) == 0) {
+	if (ioctl(evt, EVENT_IOC_WAIT, &w) == 0) {
 		*gen = w.gen;
 		return EVT_SIGNALED;
 	}
@@ -143,7 +118,8 @@ static inline int wait_for_event_gen_timeout(int evt, uint64_t *gen,
 }
 
 /*
- * signal_event(): wake every thread currently waiting on the event.
+ * signal_event(): wake every thread currently waiting on the event and
+ * advance its generation, so late waiters catch up on their next wait.
  *
  * Returns the number of threads woken (>= 0), or -1 with errno set.
  */

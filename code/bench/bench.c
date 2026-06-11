@@ -35,14 +35,13 @@
  *            one waiting -- how fast waiters re-arm), waiter_wakes (one
  *            sample per waiter: fairness of the wake distribution).
  *
- *   loop     The realistic subscriber loop: N waiters each wait (with the
- *            generation API, so nothing is ever missed), simulate -W us of
- *            work, and re-arm; the publisher signals every -P us for -d
- *            seconds. Metrics: loop_wake_ns (per caught signal: time from
- *            the signal to that waiter running), missed_signals (per
+ *   loop     The realistic subscriber loop: N waiters each wait, simulate
+ *            -W us of work, and re-arm; the publisher signals every -P us
+ *            for -d seconds. Metrics: loop_wake_ns (per caught signal: time
+ *            from the signal to that waiter running), missed_signals (per
  *            waiter: signals that fired while it was still working --
- *            coalesced by the gen API, fatal-by-design for the plain edge
- *            wait), signals_sent.
+ *            coalesced into the next wait's generation jump, never lost),
+ *            signals_sent.
  *
  *   signal0  signal cost when nobody is waiting (publish to no
  *            subscribers), batched. Metric: signal0_ns.
@@ -50,9 +49,10 @@
  *   open     create_event()+close_event() pair cost, batched. Event impl
  *            only. Metric: open_close_ns.
  *
- * Validity: the event is edge-triggered, so a round is only meaningful if
- * every waiter is parked in the kernel before the signal. The harness
- * guarantees that twice over:
+ * Validity: a wake round only measures wake latency if every waiter is
+ * parked in the kernel before the signal (a waiter that returned instantly
+ * off the generation counter measures nothing). The harness guarantees that
+ * twice over:
  *   1. the publisher polls /proc/self/task/<tid>/stat until every waiter
  *      thread reports state 'S' (by then it is registered: both event.ko and
  *      futex enqueue *before* marking the task sleeping), and
@@ -62,9 +62,10 @@
  * that is a correctness verdict, not noise.
  *
  * Build:  make            (header-only API from ../lib, plus -pthread)
- * Run:    ./bench [-i event,futex] [-s wake,churn,signal0,open]
- *                 [-N 1,2,4,16,64,256] [-r rounds] [-d churn_secs]
- *                 [-R churn_reps] [-c out.csv] [-l label] [-p cpu]
+ * Run:    ./bench [-i event,futex] [-s wake,churn,loop,signal0,open]
+ *                 [-N 1,2,4,16,64,256] [-r rounds] [-d secs] [-R reps]
+ *                 [-P period_us] [-W work_us] [-c out.csv] [-l label]
+ *                 [-p cpu]
  *
  * The event scenarios need /dev/event (event.ko loaded) on this machine;
  * `-i futex` alone runs anywhere, which is handy for testing the harness.
@@ -244,10 +245,12 @@ static void wait_all_parked(const pid_t *tids, int n, const char *who)
 
 /* --- implementations under test --------------------------------------------
  *
- * Both are squeezed into the same shape: prepare() returns a token captured
- * *before* the waiter announces readiness (the futex needs the generation it
- * will compare against; the event has no such concept), wait() parks until
- * signaled, signal_all() wakes everyone and returns how many it woke.
+ * Both share one shape, mirroring the event ABI: wait(&gen) returns once
+ * the object has been signaled past *gen -- immediately if it already has,
+ * else by parking -- and writes the current generation back; signal_all()
+ * wakes everyone and returns how many were parked. A waiter that carries
+ * its gen between calls can never lose a signal, which is also what makes
+ * the harness race-free by construction.
  */
 
 struct ctx {
@@ -260,11 +263,7 @@ struct impl {
 	bool has_open; /* supports the open (create/destroy) scenario */
 	void (*setup)(struct ctx *c);
 	void (*teardown)(struct ctx *c);
-	uint64_t (*prepare)(struct ctx *c);
-	void (*wait)(struct ctx *c, uint64_t token);
-	/* generation-aware wait: block only if no signal happened after
-	 * *gen; always write the current generation back. */
-	void (*wait_gen)(struct ctx *c, uint64_t *gen);
+	void (*wait)(struct ctx *c, uint64_t *gen);
 	int (*signal_all)(struct ctx *c);
 };
 
@@ -283,25 +282,10 @@ static void event_teardown(struct ctx *c)
 	close_event(c->fd);
 }
 
-static uint64_t event_prepare(struct ctx *c)
+static void event_wait_op(struct ctx *c, uint64_t *gen)
 {
-	(void)c;
-	return 0;
-}
-
-static void event_wait(struct ctx *c, uint64_t token)
-{
-	(void)token;
-	if (wait_for_event(c->fd) != 0)
+	if (wait_for_event(c->fd, gen) != 0)
 		die("wait_for_event: %s", strerror(errno));
-}
-
-static void event_wait_gen(struct ctx *c, uint64_t *gen)
-{
-	if (wait_for_event_gen(c->fd, gen) != 0)
-		die("wait_for_event_gen: %s (module too old for "
-		    "EVENT_IOC_WAIT_GEN?)",
-		    strerror(errno));
 }
 
 static int event_signal_all(struct ctx *c)
@@ -313,10 +297,12 @@ static int event_signal_all(struct ctx *c)
 	return woken;
 }
 
-/* futex: the control. A 32-bit generation counter; waiters FUTEX_WAIT on the
- * generation they read before parking, the publisher bumps it and
- * FUTEX_WAKEs everyone. This is the kernel-native way to build the same
- * object, so it anchors what the hardware + scheduler can do. */
+/* futex: the control. A 32-bit generation counter; waiters FUTEX_WAIT while
+ * the word still equals the generation they carry (EAGAIN = it moved before
+ * they parked = a caught signal), the publisher bumps it and FUTEX_WAKEs
+ * everyone. This is the kernel-native way to build the same object, so it
+ * anchors what the hardware + scheduler can do. The bench never runs long
+ * enough to wrap 32 bits. */
 
 static long sys_futex(_Atomic uint32_t *uaddr, int op, uint32_t val)
 {
@@ -333,31 +319,7 @@ static void futex_teardown(struct ctx *c)
 	(void)c;
 }
 
-static uint64_t futex_prepare(struct ctx *c)
-{
-	return atomic_load(&c->futex_gen);
-}
-
-static void futex_wait(struct ctx *c, uint64_t token)
-{
-	for (;;) {
-		long ret = sys_futex(&c->futex_gen, FUTEX_WAIT_PRIVATE,
-				     (uint32_t)token);
-
-		/* 0: woken. EAGAIN: generation already moved -- the "wake"
-		 * happened before we could park; either way the event fired. */
-		if (ret == 0 || errno == EAGAIN)
-			return;
-		if (errno == EINTR)
-			continue;
-		die("futex_wait: %s", strerror(errno));
-	}
-}
-
-/* The futex generation counter IS the protocol: sleep only while the word
- * still equals the generation we saw (EAGAIN = it moved before we parked =
- * a caught signal). The bench never runs long enough to wrap 32 bits. */
-static void futex_wait_gen(struct ctx *c, uint64_t *gen)
+static void futex_wait_op(struct ctx *c, uint64_t *gen)
 {
 	uint32_t cur;
 
@@ -388,9 +350,7 @@ static const struct impl impls[] = {
 		.has_open = true,
 		.setup = event_setup,
 		.teardown = event_teardown,
-		.prepare = event_prepare,
-		.wait = event_wait,
-		.wait_gen = event_wait_gen,
+		.wait = event_wait_op,
 		.signal_all = event_signal_all,
 	},
 	{
@@ -398,9 +358,7 @@ static const struct impl impls[] = {
 		.has_open = false,
 		.setup = futex_setup,
 		.teardown = futex_teardown,
-		.prepare = futex_prepare,
-		.wait = futex_wait,
-		.wait_gen = futex_wait_gen,
+		.wait = futex_wait_op,
 		.signal_all = futex_signal_all,
 	},
 };
@@ -436,6 +394,7 @@ struct wake_shared {
 	pthread_barrier_t start, done; /* both have n + 1 parties */
 	_Atomic int ready;
 	_Atomic bool quit;
+	uint64_t cur_gen; /* publisher's signal count; written between rounds */
 	pid_t *tids;
 	uint64_t *wake_ts;
 	int n;
@@ -450,7 +409,7 @@ static void *wake_waiter(void *p)
 {
 	struct wake_waiter_arg *a = p;
 	struct wake_shared *sh = a->sh;
-	uint64_t token;
+	uint64_t gen;
 
 	sh->tids[a->idx] = (pid_t)syscall(SYS_gettid);
 
@@ -458,9 +417,13 @@ static void *wake_waiter(void *p)
 		pthread_barrier_wait(&sh->start);
 		if (atomic_load(&sh->quit))
 			break;
-		token = sh->impl->prepare(sh->ctx);
+		/* Adopt the publisher's generation so this wait really
+		 * parks (a stale gen would return immediately and the
+		 * round would measure nothing). Plain read is fine: the
+		 * publisher wrote it before the start barrier. */
+		gen = sh->cur_gen;
 		atomic_fetch_add(&sh->ready, 1);
-		sh->impl->wait(sh->ctx, token);
+		sh->impl->wait(sh->ctx, &gen);
 		sh->wake_ts[a->idx] = now_ns();
 		pthread_barrier_wait(&sh->done);
 	}
@@ -511,6 +474,7 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 		t0 = now_ns();
 		woken = impl->signal_all(sh.ctx);
 		t1 = now_ns();
+		sh.cur_gen++;
 
 		/* The parked check above should make woken == n always; if
 		 * not, the impl has a registration race. Release the
@@ -522,6 +486,7 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 				    "and stragglers won't wake -- lost waiter",
 				    impl->name, n, r, woken, n);
 			woken += impl->signal_all(sh.ctx);
+			sh.cur_gen++;
 			sched_yield();
 		}
 
@@ -615,14 +580,13 @@ static void *churn_waiter(void *p)
 {
 	struct churn_waiter_arg *a = p;
 	struct churn_shared *sh = a->sh;
+	uint64_t gen = 0;
 
 	pthread_barrier_wait(&sh->start);
 	for (;;) {
-		uint64_t token = sh->impl->prepare(sh->ctx);
-
 		if (atomic_load(&sh->stop))
 			break;
-		sh->impl->wait(sh->ctx, token);
+		sh->impl->wait(sh->ctx, &gen);
 		atomic_fetch_add(&sh->counts[a->idx].c, 1);
 	}
 	atomic_fetch_add(&sh->exited, 1);
@@ -723,13 +687,13 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 
 /* --- scenario: loop (the realistic subscriber loop) -------------------------
  *
- * N waiters: wait (generation-aware) -> simulate work -> re-arm, forever.
- * One publisher signals on a fixed period. This is the production shape for
- * "many listeners on one event": the gen API guarantees a listener that was
+ * N waiters: wait -> simulate work -> re-arm, forever. One publisher
+ * signals on a fixed period. This is the production shape for "many
+ * listeners on one event": the generation guarantees a listener that was
  * still working when a signal fired sees it on the next call instead of
  * sleeping into the void, and the bench counts exactly how often that
- * happened (missed_signals -- with the plain edge wait every one of those
- * would be a silently lost event).
+ * happened (missed_signals -- with an edge-triggered design every one of
+ * those would be a silently lost event).
  *
  * Latency accounting: the publisher stamps each generation g in a ring just
  * before signaling; a waiter whose wait returned generation prev+1 was
@@ -767,7 +731,7 @@ static void *loop_waiter(void *p)
 	pthread_barrier_wait(&sh->start);
 	for (;;) {
 		prev = gen;
-		sh->impl->wait_gen(sh->ctx, &gen);
+		sh->impl->wait(sh->ctx, &gen);
 		if (atomic_load(&sh->stop))
 			break;
 		t = now_ns();

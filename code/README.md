@@ -20,12 +20,13 @@ sleeps in the kernel and is woken the instant the event is signaled.
 - A **publisher** signals the event, which walks the subscriber list and sets
   every parked thread back to `TASK_RUNNING` — waking them all at once.
 
-The plain wait is **edge-triggered / one-shot**: signaling wakes exactly the
-threads that are *already* waiting, and a thread that registers after the
-signal blocks until the next one. For wait/work/re-arm loops that must not
-miss signals fired while they were busy, the **generation-aware wait**
-(`wait_for_event_gen`) returns immediately when the event was signaled since
-the generation the caller last saw — every signal is observed, late or not.
+Signals are **counted**: every `signal_event()` bumps the event's generation,
+and a wait carries the generation its caller last observed. An up-to-date
+waiter parks until the next signal; a waiter that was busy when a signal
+fired returns immediately on its next wait. So a wait/work/re-arm loop
+observes every signal, no matter how late it re-arms — a burst during one
+stretch of work coalesces into a single return with the generation jumped by
+the burst size.
 
 ## Layout
 
@@ -56,11 +57,9 @@ You compile and load `event.ko`. In your program you `#include "event.h"` (from
 | Function | Role | Meaning |
 | --- | --- | --- |
 | `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
-| `int wait_for_event(int evt)` | subscriber | Register the calling thread and block until the event is signaled. Returns 0 on wake. |
-| `int wait_for_event_gen(int evt, uint64_t *gen)` | subscriber | Like `wait_for_event`, but returns immediately if the event was signaled after generation `*gen` — a re-arming loop misses nothing. Updates `*gen`. |
-| `int wait_for_event_timeout(int evt, int64_t ms)` | subscriber | Bounded wait: `EVT_SIGNALED` on wake, `EVT_TIMEOUT` after `ms` milliseconds. `EVT_WAIT_FOREVER` / `EVT_WAIT_ZERO` for the extremes. |
-| `int wait_for_event_gen_timeout(int evt, uint64_t *gen, int64_t ms)` | subscriber | Generation-aware wait with a timeout — both of the above combined. |
-| `int signal_event(int evt)` | publisher | Wake every thread currently waiting. Returns the number woken. |
+| `int wait_for_event(int evt, uint64_t *gen)` | subscriber | Block until the event is signaled past `*gen` — immediately if it already has been. Start with `*gen = 0`; updated on return. |
+| `int wait_for_event_timeout(int evt, uint64_t *gen, int64_t ms)` | subscriber | The same, bounded: `EVT_SIGNALED` on wake, `EVT_TIMEOUT` after `ms` milliseconds. `EVT_WAIT_FOREVER` / `EVT_WAIT_ZERO` for the extremes. |
+| `int signal_event(int evt)` | publisher | Bump the generation and wake every thread currently waiting. Returns the number woken. |
 | `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
 
 An event *is* an open fd, which makes sharing natural: open the event, then
@@ -78,11 +77,18 @@ to a LIFO list of subscriber nodes, and every shared access is one atomic
 operation — there is no spinlock anywhere.
 
 ```c
-/* wait_for_event(): register (one cmpxchg), then block until signaled. */
-static int wait_for_event(struct event *evt)
+/* do_wait(): return once the event is signaled past w->gen -- immediately
+ * if it already has been, else register (one cmpxchg) and park. */
+static int do_wait(struct event *evt, struct event_wait *w)
 {
-        struct subscriber *sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
+        struct subscriber *sub;
 
+        if ((u64)atomic64_read(&evt->gen) != w->gen) {
+                w->gen = atomic64_read(&evt->gen);
+                return 0;                 /* signaled while the caller was away */
+        }
+
+        sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
         sub->task  = current;             /* no refcount: RCU protects the wake */
         sub->state = EV_WAITING;
 
@@ -94,25 +100,34 @@ static int wait_for_event(struct event *evt)
                 set_current_state(TASK_INTERRUPTIBLE);
                 if (smp_load_acquire(&sub->state) == EV_SIGNALED)
                         break;            /* the signaler handed us the node */
-                if (signal_pending(current)) {
+                if ((u64)atomic64_read(&evt->gen) != w->gen) {
+                        /* a signal claimed the list before our push; resolve
+                         * the node like a cancellation, report the signal */
                         if (cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED)
                             == EV_WAITING)
-                                return -ERESTARTSYS;  /* node abandoned in place */
-                        break;            /* lost the race: we were signaled */
+                                sub = NULL;           /* abandoned in place */
+                        break;
                 }
-                schedule();
+                if (signal_pending(current)) { /* -ERESTARTSYS, same resolve */ }
+                schedule();               /* or schedule_hrtimeout() -> -ETIMEDOUT */
         }
         __set_current_state(TASK_RUNNING);
-        kmem_cache_free(subscriber_cache, sub);  /* ours on the signaled path */
+
+        if (sub)
+                kmem_cache_free(subscriber_cache, sub); /* ours when signaled */
+        w->gen = atomic64_read(&evt->gen);
         return 0;
 }
 
-/* signal_event(): claim the whole list with one xchg, wake every node. */
+/* signal_event(): bump the generation, claim the whole list with one xchg,
+ * wake every node. */
 static int signal_event(struct event *evt)
 {
         struct subscriber *sub, *next;
         int woken = 0;
 
+        atomic64_inc(&evt->gen);                  /* the signal exists before */
+                                                  /* anyone can observe it    */
         if (!READ_ONCE(evt->head))                /* common case: nobody is   */
                 return 0;                         /* waiting; don't dirty the */
                                                   /* cacheline with an xchg   */
@@ -141,13 +156,15 @@ Why this is safe without a lock:
 - **Take-all claiming.** `signal_event()` detaches the entire list with one
   `xchg`, after which it owns every claimed node outright — concurrent
   signalers get disjoint chains, and new waiters push onto the fresh empty
-  list (the event stays edge-triggered). Take-all is also what makes the
+  list and catch up through the generation. Take-all is also what makes the
   push-only `cmpxchg` immune to ABA.
 - **Ownership handoff by state.** The single atomic that moves a node out of
   `EV_WAITING` decides who frees it: a signaler's `xchg → EV_SIGNALED` hands
-  the node to the waiter; an interrupted waiter's `cmpxchg → EV_CANCELLED`
-  abandons the node in place (it cannot be unlinked from the middle of the
-  list without a lock) for the next signal or the final `close()` to free.
+  the node to the waiter; a waiter that leaves early — interrupting POSIX
+  signal, timeout, or a generation bump that raced past its registration —
+  wins it back with `cmpxchg → EV_CANCELLED` and abandons it in place (it
+  cannot be unlinked from the middle of the list without a lock) for the
+  next signal or the final `close()` to free.
 - **RCU-protected wakes, no refcounting.** A node still `EV_WAITING` at the
   signaler's `xchg` proves its waiter was inside `wait_for_event()` at that
   instant — it cannot return (let alone exit) before observing
@@ -201,9 +218,10 @@ Expected output (order of the wake-ups varies — they all unblock together):
 [sender | pid 1234] done (0 failures)
 ```
 
-> The demo `sleep(1)`s before signaling so every forked listener has time to
-> register first. Because the event is one-shot, a listener that hasn't reached
-> `wait_for_event()` by the time the sender signals would miss it.
+> The demo `sleep(1)`s before signaling only so the "waiting..." lines print
+> before the wake-ups. Signals are counted in the event's generation, so a
+> listener that reaches `wait_for_event()` late returns immediately instead
+> of missing the signal.
 
 ### Debugging the demo in VS Code
 

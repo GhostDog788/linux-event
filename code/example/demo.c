@@ -30,11 +30,13 @@
 /* Child path: register on the event, block, then report the wake-up. */
 static int run_listener(int evt, int id)
 {
+	uint64_t gen = 0; /* fresh listener: has seen no signals yet */
+
 	printf("  [listener %d | pid %d] waiting for the event...\n", id,
 	       (int)getpid());
 	fflush(stdout);
 
-	if (wait_for_event(evt) != 0) {
+	if (wait_for_event(evt, &gen) != 0) {
 		fprintf(stderr,
 			"  [listener %d | pid %d] wait_for_event failed: %s\n",
 			id, (int)getpid(), strerror(errno));
@@ -102,11 +104,12 @@ int main(int argc, char **argv)
 	}
 
 	/*
-	 * Give the listeners a moment to call wait_for_event() and register.
-	 * The event is edge-triggered: a listener that has not registered by the
-	 * time we signal would miss this signal. One second is plenty for a demo.
+	 * Give the listeners a moment to print their "waiting..." line so the
+	 * output reads in order. Purely cosmetic: signals are counted in the
+	 * event's generation, so a listener that calls wait_for_event() only
+	 * after we signal still returns immediately instead of missing it.
 	 */
-	sleep(5);
+	sleep(1);
 
 	printf("[sender | pid %d] signaling the event -- waking all listeners\n",
 	       (int)getpid());
