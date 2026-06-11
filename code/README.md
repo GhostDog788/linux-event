@@ -20,9 +20,12 @@ sleeps in the kernel and is woken the instant the event is signaled.
 - A **publisher** signals the event, which walks the subscriber list and sets
   every parked thread back to `TASK_RUNNING` — waking them all at once.
 
-The event is **edge-triggered / one-shot**: signaling wakes exactly the threads
-that are *already* waiting. A thread that registers after the signal will block
-until the next signal.
+The plain wait is **edge-triggered / one-shot**: signaling wakes exactly the
+threads that are *already* waiting, and a thread that registers after the
+signal blocks until the next one. For wait/work/re-arm loops that must not
+miss signals fired while they were busy, the **generation-aware wait**
+(`wait_for_event_gen`) returns immediately when the event was signaled since
+the generation the caller last saw — every signal is observed, late or not.
 
 ## Layout
 
@@ -54,6 +57,7 @@ You compile and load `event.ko`. In your program you `#include "event.h"` (from
 | --- | --- | --- |
 | `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
 | `int wait_for_event(int evt)` | subscriber | Register the calling thread and block until the event is signaled. Returns 0 on wake. |
+| `int wait_for_event_gen(int evt, uint64_t *gen)` | subscriber | Like `wait_for_event`, but returns immediately if the event was signaled after generation `*gen` — a re-arming loop misses nothing. Updates `*gen`. |
 | `int signal_event(int evt)` | publisher | Wake every thread currently waiting. Returns the number woken. |
 | `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
 

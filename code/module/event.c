@@ -72,6 +72,7 @@
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 
 #include "event_uapi.h"
 
@@ -97,9 +98,21 @@ struct subscriber {
 
 struct event {
 	struct subscriber *head; /* lock-free LIFO; cmpxchg/xchg only */
+	atomic64_t gen;		 /* signal count; never decreases */
 };
 
 static struct kmem_cache *subscriber_cache;
+
+/*
+ * Take the node back from the signalers. True: we won, the node is now
+ * abandoned in place (EV_CANCELLED) for a later signal/release to free --
+ * the caller must NOT free or touch it again. False: a signaler got there
+ * first; we have been signaled and the node is ours to free.
+ */
+static bool subscriber_cancel(struct subscriber *sub)
+{
+	return cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) == EV_WAITING;
+}
 
 /* create_event(): each open() hands out a brand-new event object. */
 static int event_open(struct inode *inode, struct file *file)
@@ -141,19 +154,46 @@ static int event_release(struct inode *inode, struct file *file)
 }
 
 /*
- * wait_for_event(): register the calling thread and block until the event is
+ * do_wait(): register the calling thread and block until the event is
  * signaled (or a signal interrupts the wait).
+ *
+ * @genp selects the two wait flavors:
+ *
+ *   NULL      EVENT_IOC_WAIT: pure edge-triggered -- only a signal that
+ *             fires while we are registered wakes us.
+ *
+ *   non-NULL  EVENT_IOC_WAIT_GEN: *genp holds the last signal generation
+ *             the caller saw. If the event has been signaled since, return
+ *             immediately -- the caller was busy when the signal fired and
+ *             must not miss it (this is what makes a wait/work/re-arm loop
+ *             lose no events). Otherwise block as usual. The current
+ *             generation is written back on every successful return.
  *
  * The lost-wakeup race is closed the classic way: the task state is set to
  * TASK_INTERRUPTIBLE *before* re-checking ->state, so a signaler either sees
  * us parked (and wakes us) or we see EV_SIGNALED (and skip the sleep).
  * set_current_state() is a full barrier; the acquire load below pairs with
  * the signaler's fully-ordered xchg() of ->state.
+ *
+ * A signal can also slip in between the entry generation check and our list
+ * push (it claims the list without our node, so it will never mark us
+ * EV_SIGNALED). The generation re-check inside the loop catches exactly
+ * that window: our push and set_current_state() are full barriers, so after
+ * them we cannot read a generation older than one bumped before the claim.
  */
-static int wait_for_event(struct event *evt)
+static int do_wait(struct event *evt, u64 *genp)
 {
 	struct subscriber *sub;
 	int ret = 0;
+
+	if (genp) {
+		u64 cur = (u64)atomic64_read(&evt->gen);
+
+		if (cur != *genp) {
+			*genp = cur;
+			return 0; /* missed signal(s); report immediately */
+		}
+	}
 
 	sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
 	if (!sub)
@@ -177,16 +217,28 @@ static int wait_for_event(struct event *evt)
 		if (smp_load_acquire(&sub->state) == EV_SIGNALED)
 			break;
 
+		if (genp && (u64)atomic64_read(&evt->gen) != *genp) {
+			/*
+			 * A signal fired but claimed the list before our
+			 * push, so it will never wake us -- yet the caller
+			 * must see it. Resolve the node like a cancellation
+			 * and report the signal. (If the cancel loses, an
+			 * even newer signal did claim us: same outcome.)
+			 */
+			if (subscriber_cancel(sub))
+				sub = NULL; /* abandoned */
+			break;
+		}
+
 		if (signal_pending(current)) {
 			/*
-			 * Try to take the node back from the signalers. If we
-			 * win, the node stays on the list as EV_CANCELLED for
-			 * a later signal/release to free -- we must not free
-			 * it ourselves, it is still linked. If we lose, a
-			 * signaler is already waking us: report success.
+			 * If we win the node back, it stays on the list as
+			 * EV_CANCELLED for a later signal/release to free --
+			 * we must not free it ourselves, it is still linked.
+			 * If we lose, a signaler is already waking us: report
+			 * success.
 			 */
-			if (cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) ==
-			    EV_WAITING) {
+			if (subscriber_cancel(sub)) {
 				ret = -ERESTARTSYS;
 				sub = NULL; /* abandoned */
 			}
@@ -200,6 +252,9 @@ static int wait_for_event(struct event *evt)
 	/* EV_SIGNALED: the signaler is done with the node; we own it. */
 	if (sub)
 		kmem_cache_free(subscriber_cache, sub);
+
+	if (genp && ret == 0)
+		*genp = (u64)atomic64_read(&evt->gen);
 
 	return ret;
 }
@@ -223,6 +278,16 @@ static int signal_event(struct event *evt)
 {
 	struct subscriber *sub, *next;
 	int woken = 0;
+
+	/*
+	 * Bump the generation FIRST, so that by the time any waiter is woken
+	 * (or any late waiter checks), the signal is already visible in the
+	 * counter. The fully-ordered xchg()/cmpxchg() traffic on ->head and
+	 * ->state orders this increment for everyone who needs it: a waiter
+	 * whose push lands after our claim below performs a full barrier
+	 * (its cmpxchg) and then cannot read a pre-increment generation.
+	 */
+	atomic64_inc(&evt->gen);
 
 	/*
 	 * Common fast path: nobody is waiting. A plain read keeps the
@@ -264,7 +329,19 @@ static long event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case EVENT_IOC_WAIT:
-		return wait_for_event(evt);
+		return do_wait(evt, NULL);
+	case EVENT_IOC_WAIT_GEN: {
+		u64 __user *ugen = (u64 __user *)arg;
+		u64 gen;
+		int ret;
+
+		if (copy_from_user(&gen, ugen, sizeof(gen)))
+			return -EFAULT;
+		ret = do_wait(evt, &gen);
+		if (!ret && copy_to_user(ugen, &gen, sizeof(gen)))
+			return -EFAULT;
+		return ret;
+	}
 	case EVENT_IOC_SIGNAL:
 		return signal_event(evt);
 	default:
@@ -321,4 +398,4 @@ module_exit(event_exit);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
 MODULE_DESCRIPTION("Minimal event synchronization object (/dev/event), lock-free");
-MODULE_VERSION("3.0");
+MODULE_VERSION("3.1");
