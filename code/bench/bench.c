@@ -35,6 +35,15 @@
  *            one waiting -- how fast waiters re-arm), waiter_wakes (one
  *            sample per waiter: fairness of the wake distribution).
  *
+ *   loop     The realistic subscriber loop: N waiters each wait (with the
+ *            generation API, so nothing is ever missed), simulate -W us of
+ *            work, and re-arm; the publisher signals every -P us for -d
+ *            seconds. Metrics: loop_wake_ns (per caught signal: time from
+ *            the signal to that waiter running), missed_signals (per
+ *            waiter: signals that fired while it was still working --
+ *            coalesced by the gen API, fatal-by-design for the plain edge
+ *            wait), signals_sent.
+ *
  *   signal0  signal cost when nobody is waiting (publish to no
  *            subscribers), batched. Metric: signal0_ns.
  *
@@ -253,6 +262,9 @@ struct impl {
 	void (*teardown)(struct ctx *c);
 	uint64_t (*prepare)(struct ctx *c);
 	void (*wait)(struct ctx *c, uint64_t token);
+	/* generation-aware wait: block only if no signal happened after
+	 * *gen; always write the current generation back. */
+	void (*wait_gen)(struct ctx *c, uint64_t *gen);
 	int (*signal_all)(struct ctx *c);
 };
 
@@ -282,6 +294,14 @@ static void event_wait(struct ctx *c, uint64_t token)
 	(void)token;
 	if (wait_for_event(c->fd) != 0)
 		die("wait_for_event: %s", strerror(errno));
+}
+
+static void event_wait_gen(struct ctx *c, uint64_t *gen)
+{
+	if (wait_for_event_gen(c->fd, gen) != 0)
+		die("wait_for_event_gen: %s (module too old for "
+		    "EVENT_IOC_WAIT_GEN?)",
+		    strerror(errno));
 }
 
 static int event_signal_all(struct ctx *c)
@@ -334,6 +354,23 @@ static void futex_wait(struct ctx *c, uint64_t token)
 	}
 }
 
+/* The futex generation counter IS the protocol: sleep only while the word
+ * still equals the generation we saw (EAGAIN = it moved before we parked =
+ * a caught signal). The bench never runs long enough to wrap 32 bits. */
+static void futex_wait_gen(struct ctx *c, uint64_t *gen)
+{
+	uint32_t cur;
+
+	while ((cur = atomic_load(&c->futex_gen)) == (uint32_t)*gen) {
+		long ret = sys_futex(&c->futex_gen, FUTEX_WAIT_PRIVATE,
+				     (uint32_t)*gen);
+
+		if (ret < 0 && errno != EAGAIN && errno != EINTR)
+			die("futex_wait: %s", strerror(errno));
+	}
+	*gen = cur;
+}
+
 static int futex_signal_all(struct ctx *c)
 {
 	long woken;
@@ -353,6 +390,7 @@ static const struct impl impls[] = {
 		.teardown = event_teardown,
 		.prepare = event_prepare,
 		.wait = event_wait,
+		.wait_gen = event_wait_gen,
 		.signal_all = event_signal_all,
 	},
 	{
@@ -362,6 +400,7 @@ static const struct impl impls[] = {
 		.teardown = futex_teardown,
 		.prepare = futex_prepare,
 		.wait = futex_wait,
+		.wait_gen = futex_wait_gen,
 		.signal_all = futex_signal_all,
 	},
 };
@@ -682,6 +721,161 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 	}
 }
 
+/* --- scenario: loop (the realistic subscriber loop) -------------------------
+ *
+ * N waiters: wait (generation-aware) -> simulate work -> re-arm, forever.
+ * One publisher signals on a fixed period. This is the production shape for
+ * "many listeners on one event": the gen API guarantees a listener that was
+ * still working when a signal fired sees it on the next call instead of
+ * sleeping into the void, and the bench counts exactly how often that
+ * happened (missed_signals -- with the plain edge wait every one of those
+ * would be a silently lost event).
+ *
+ * Latency accounting: the publisher stamps each generation g in a ring just
+ * before signaling; a waiter whose wait returned generation prev+1 was
+ * parked when that signal fired, so (now - ring[g]) is true wake latency.
+ * A jump (gen > prev+1) means the waiter worked through >= 1 signal: the
+ * skipped ones count as missed, and no latency sample is taken (the waiter
+ * wasn't waiting -- there is nothing to time).
+ */
+
+#define LOOP_RING 65536 /* power of two; >> any realistic lag in signals */
+
+struct loop_shared {
+	const struct impl *impl;
+	struct ctx *ctx;
+	pthread_barrier_t start; /* n + 1 parties */
+	_Atomic bool stop;
+	_Atomic int exited;
+	uint64_t *ring; /* signal timestamps, indexed by generation */
+	uint64_t work_ns;
+	int n;
+};
+
+struct loop_waiter_arg {
+	struct loop_shared *sh;
+	struct vec lat;
+	uint64_t caught, missed;
+};
+
+static void *loop_waiter(void *p)
+{
+	struct loop_waiter_arg *a = p;
+	struct loop_shared *sh = a->sh;
+	uint64_t gen = 0, prev, t;
+
+	pthread_barrier_wait(&sh->start);
+	for (;;) {
+		prev = gen;
+		sh->impl->wait_gen(sh->ctx, &gen);
+		if (atomic_load(&sh->stop))
+			break;
+		t = now_ns();
+		if (gen == prev + 1) {
+			vec_push(&a->lat,
+				 (double)(t - sh->ring[gen % LOOP_RING]));
+			a->caught++;
+		} else {
+			a->missed += gen - prev - 1;
+			a->caught++; /* the latest one was still delivered */
+		}
+		while (sh->work_ns && now_ns() < t + sh->work_ns)
+			relax(); /* simulate the listener's work */
+	}
+	atomic_fetch_add(&sh->exited, 1);
+	return NULL;
+}
+
+static void run_loop(const struct impl *impl, int n, double dur_secs,
+		     uint64_t period_us, uint64_t work_us)
+{
+	struct loop_shared sh = { .impl = impl,
+				  .n = n,
+				  .work_ns = work_us * 1000 };
+	struct loop_waiter_arg *args;
+	pthread_t *threads;
+	struct ctx ctx;
+	struct vec lat = { 0 };
+	uint64_t t_end, t_next, g = 0, drain_deadline;
+	uint64_t caught = 0, missed = 0;
+	int i;
+
+	impl->setup(&ctx);
+	sh.ctx = &ctx;
+	sh.ring = calloc(LOOP_RING, sizeof(*sh.ring));
+	threads = calloc(n, sizeof(*threads));
+	args = calloc(n, sizeof(*args));
+	if (!sh.ring || !threads || !args)
+		die("out of memory");
+	pthread_barrier_init(&sh.start, NULL, n + 1);
+
+	for (i = 0; i < n; i++) {
+		args[i] = (struct loop_waiter_arg){ .sh = &sh };
+		threads[i] = spawn_waiter(loop_waiter, &args[i]);
+	}
+	pthread_barrier_wait(&sh.start);
+
+	t_next = now_ns();
+	t_end = t_next + (uint64_t)(dur_secs * NSEC_PER_SEC);
+	while (now_ns() < t_end) {
+		struct timespec ts;
+
+		g++;
+		sh.ring[g % LOOP_RING] = now_ns();
+		impl->signal_all(sh.ctx);
+
+		t_next += period_us * 1000;
+		ts.tv_sec = t_next / NSEC_PER_SEC;
+		ts.tv_nsec = t_next % NSEC_PER_SEC;
+		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
+	}
+
+	atomic_store(&sh.stop, true);
+	drain_deadline = now_ns() + STUCK_TIMEOUT_NS;
+	while (atomic_load(&sh.exited) < n) {
+		if (now_ns() > drain_deadline)
+			die("loop/%s n=%d: waiters won't drain", impl->name,
+			    n);
+		impl->signal_all(sh.ctx);
+		usleep(1000);
+	}
+	for (i = 0; i < n; i++)
+		pthread_join(threads[i], NULL);
+
+	for (i = 0; i < n; i++) {
+		size_t s;
+
+		caught += args[i].caught;
+		missed += args[i].missed;
+		for (s = 0; s < args[i].lat.n; s++) {
+			vec_push(&lat, args[i].lat.v[s]);
+			csv_emit("loop", impl->name, n, i, "loop_wake_ns",
+				 args[i].lat.v[s]);
+		}
+		csv_emit("loop", impl->name, n, i, "missed_signals",
+			 (double)args[i].missed);
+		vec_reset(&args[i].lat);
+	}
+	csv_emit("loop", impl->name, n, -1, "signals_sent", (double)g);
+
+	printf("loop    %-6s n=%-4d period=%lluus work=%lluus  "
+	       "signals=%-6llu  wake p50=%8.2fus p99=%8.2fus  "
+	       "missed=%llu (%.2f%% of deliveries)\n",
+	       impl->name, n, (unsigned long long)period_us,
+	       (unsigned long long)work_us, (unsigned long long)g,
+	       vec_pct(&lat, 50) / 1e3, vec_pct(&lat, 99) / 1e3,
+	       (unsigned long long)missed,
+	       g && n ? 100.0 * (double)missed / ((double)g * n) : 0.0);
+	(void)caught;
+
+	pthread_barrier_destroy(&sh.start);
+	vec_reset(&lat);
+	free(sh.ring);
+	free(threads);
+	free(args);
+	impl->teardown(&ctx);
+}
+
 /* --- scenario: signal0 (publish with no subscribers) ------------------------ */
 
 #define BATCH_OPS 1000
@@ -787,12 +981,14 @@ static void usage(const char *argv0)
 	fprintf(stderr,
 		"usage: %s [options]\n"
 		"  -i list   implementations: event,futex (default both)\n"
-		"  -s list   scenarios: wake,churn,signal0,open (default all)\n"
+		"  -s list   scenarios: wake,churn,loop,signal0,open (default all)\n"
 		"  -N list   waiter counts to sweep (default 1,2,4,16,64,256)\n"
 		"  -r n      wake rounds per waiter count (default 100)\n"
-		"  -d secs   churn duration per rep (default 1.0)\n"
+		"  -d secs   churn/loop duration per rep (default 1.0)\n"
 		"  -R n      churn reps per waiter count (default 10; fewer\n"
 		"            than 8 is too thin for compare.py's verdict)\n"
+		"  -P us     loop: publisher signal period (default 2000)\n"
+		"  -W us     loop: per-waiter simulated work (default 0)\n"
 		"  -c file   write raw samples as CSV (for compare.py)\n"
 		"  -l label  tag CSV rows (e.g. git revision)\n"
 		"  -p cpu    pin the publisher thread to this CPU\n",
@@ -803,16 +999,17 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
 	const char *impl_list = "event,futex";
-	const char *scen_list = "wake,churn,signal0,open";
+	const char *scen_list = "wake,churn,loop,signal0,open";
 	const char *csv_path = NULL;
 	int counts[64] = { 1, 2, 4, 16, 64, 256 };
 	int ncounts = 6, rounds = 100, churn_reps = 10, pin_cpu = -1;
+	uint64_t loop_period_us = 2000, loop_work_us = 0;
 	double churn_secs = 1.0;
 	struct utsname uts;
 	size_t ii;
 	int opt, ci;
 
-	while ((opt = getopt(argc, argv, "i:s:N:r:d:R:c:l:p:h")) != -1) {
+	while ((opt = getopt(argc, argv, "i:s:N:r:d:R:P:W:c:l:p:h")) != -1) {
 		switch (opt) {
 		case 'i':
 			impl_list = optarg;
@@ -832,6 +1029,12 @@ int main(int argc, char **argv)
 		case 'R':
 			churn_reps = atoi(optarg);
 			break;
+		case 'P':
+			loop_period_us = strtoull(optarg, NULL, 10);
+			break;
+		case 'W':
+			loop_work_us = strtoull(optarg, NULL, 10);
+			break;
 		case 'c':
 			csv_path = optarg;
 			break;
@@ -845,7 +1048,8 @@ int main(int argc, char **argv)
 			usage(argv[0]);
 		}
 	}
-	if (rounds < 1 || churn_reps < 1 || churn_secs <= 0)
+	if (rounds < 1 || churn_reps < 1 || churn_secs <= 0 ||
+	    loop_period_us < 1)
 		usage(argv[0]);
 
 	if (pin_cpu >= 0) {
@@ -886,6 +1090,10 @@ int main(int argc, char **argv)
 			for (ci = 0; ci < ncounts; ci++)
 				run_churn(impl, counts[ci], churn_secs,
 					  churn_reps);
+		if (list_has(scen_list, "loop"))
+			for (ci = 0; ci < ncounts; ci++)
+				run_loop(impl, counts[ci], churn_secs,
+					 loop_period_us, loop_work_us);
 		if (list_has(scen_list, "signal0"))
 			run_signal0(impl);
 		if (list_has(scen_list, "open") && impl->has_open)

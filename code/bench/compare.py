@@ -34,7 +34,8 @@ MIN_EFFECT = 0.03   # ignore median shifts under 3% even if "significant"
 # Direction of "better" per metric. Metrics absent here (e.g. the churn
 # diagnostics) are informational: printed, never given a verdict.
 LOWER_IS_BETTER = {"wake_ns", "last_wake_ns", "signal_call_ns",
-                   "signal0_ns", "open_close_ns"}
+                   "signal0_ns", "open_close_ns", "loop_wake_ns",
+                   "missed_signals"}
 HIGHER_IS_BETTER = {"wakes_per_sec"}
 
 

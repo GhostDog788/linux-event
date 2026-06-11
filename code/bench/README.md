@@ -57,6 +57,8 @@ Rules that make the result definitive rather than anecdotal:
 | `churn` | `wakes_per_sec` | sustained subscribers-woken throughput with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
 | `churn` | `empty_signal_pct` | how often the publisher found nobody parked | diagnostic: high % = waiters re-arm slower than the publisher signals |
 | `churn` | `waiter_wakes` | per-waiter wake counts | fairness: one starved waiter shows up as a low outlier |
+| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; uses the generation API, so set `-P`/`-W` to your real workload's numbers |
+| `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced by the gen API) | if this is nonzero, the plain edge-triggered wait would have silently *lost* these events — a correctness number, not just a performance one |
 | `signal0` | `signal0_ns` | signal cost with zero subscribers | events that are mostly idle ("publish and nobody listens") |
 | `open` | `open_close_ns` | create + destroy cost | short-lived events created per request |
 
