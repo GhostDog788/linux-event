@@ -25,6 +25,7 @@
 #ifndef EVENT_H
 #define EVENT_H
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
@@ -40,6 +41,24 @@ extern "C" {
 #define EVENT_IOC_WAIT _IO(EVENT_IOC_MAGIC, 1)
 #define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
 #define EVENT_IOC_WAIT_GEN _IOWR(EVENT_IOC_MAGIC, 3, uint64_t)
+
+/* Must match struct event_wait in ../module/event_uapi.h exactly. */
+struct event_wait {
+	uint64_t gen;
+	int64_t timeout_ms;
+	uint32_t flags;
+	uint32_t reserved;
+};
+
+#define EVENT_WAIT_FL_GEN 0x1u
+
+#define EVENT_IOC_WAIT_EX _IOWR(EVENT_IOC_MAGIC, 4, struct event_wait)
+
+/* Timeout values and results for the *_timeout waits (see the design doc). */
+#define EVT_WAIT_FOREVER (-1)
+#define EVT_WAIT_ZERO 0
+#define EVT_SIGNALED 0
+#define EVT_TIMEOUT 1
 
 /*
  * create_event(): allocate a new event object in the kernel.
@@ -84,6 +103,43 @@ static inline int wait_for_event(int evt)
 static inline int wait_for_event_gen(int evt, uint64_t *gen)
 {
 	return ioctl(evt, EVENT_IOC_WAIT_GEN, gen);
+}
+
+/*
+ * wait_for_event_timeout(): wait_for_event() bounded in time.
+ *
+ * @timeout_ms: milliseconds to wait. EVT_WAIT_FOREVER (-1) never times out;
+ * EVT_WAIT_ZERO (0) returns immediately (a poll).
+ *
+ * Returns EVT_SIGNALED when the event fired within the limit, EVT_TIMEOUT
+ * when it did not, or -1 with errno set (EINTR if a signal interrupted).
+ */
+static inline int wait_for_event_timeout(int evt, int64_t timeout_ms)
+{
+	struct event_wait w = { .timeout_ms = timeout_ms };
+
+	if (ioctl(evt, EVENT_IOC_WAIT_EX, &w) == 0)
+		return EVT_SIGNALED;
+	return errno == ETIMEDOUT ? EVT_TIMEOUT : -1;
+}
+
+/*
+ * wait_for_event_gen_timeout(): the generation-aware wait, bounded in time.
+ * Combines wait_for_event_gen() (no missed signals across a re-arm loop)
+ * with the timeout semantics above. *gen is updated on EVT_SIGNALED.
+ */
+static inline int wait_for_event_gen_timeout(int evt, uint64_t *gen,
+					     int64_t timeout_ms)
+{
+	struct event_wait w = { .gen = *gen,
+				.timeout_ms = timeout_ms,
+				.flags = EVENT_WAIT_FL_GEN };
+
+	if (ioctl(evt, EVENT_IOC_WAIT_EX, &w) == 0) {
+		*gen = w.gen;
+		return EVT_SIGNALED;
+	}
+	return errno == ETIMEDOUT ? EVT_TIMEOUT : -1;
 }
 
 /*

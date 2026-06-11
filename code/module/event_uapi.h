@@ -32,4 +32,23 @@
  */
 #define EVENT_IOC_WAIT_GEN _IOWR(EVENT_IOC_MAGIC, 3, __u64)
 
+/*
+ * Extended wait: generation awareness and/or a timeout, in one call.
+ *
+ * timeout_ms < 0 waits forever; 0 polls (returns -ETIMEDOUT immediately if
+ * the event is not pending); > 0 waits at most that many milliseconds and
+ * fails with -ETIMEDOUT if no signal arrived. gen is honored (and written
+ * back) only when EVENT_WAIT_FL_GEN is set in flags; reserved must be 0.
+ */
+struct event_wait {
+	__u64 gen;	  /* in/out: last seen generation (with FL_GEN) */
+	__s64 timeout_ms; /* in: < 0 = forever, 0 = poll */
+	__u32 flags;	  /* in: EVENT_WAIT_FL_* */
+	__u32 reserved;	  /* in: must be 0 */
+};
+
+#define EVENT_WAIT_FL_GEN 0x1u
+
+#define EVENT_IOC_WAIT_EX _IOWR(EVENT_IOC_MAGIC, 4, struct event_wait)
+
 #endif /* EVENT_UAPI_H */

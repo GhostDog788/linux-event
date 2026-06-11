@@ -64,8 +64,10 @@
  */
 
 #include <linux/atomic.h>
+#include <linux/hrtimer.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/rcupdate.h>
@@ -180,11 +182,20 @@ static int event_release(struct inode *inode, struct file *file)
  * EV_SIGNALED). The generation re-check inside the loop catches exactly
  * that window: our push and set_current_state() are full barriers, so after
  * them we cannot read a generation older than one bumped before the claim.
+ *
+ * @timeout_ms bounds the wait: < 0 waits forever, 0 polls, > 0 returns
+ * -ETIMEDOUT once that many milliseconds pass unsignaled. A timed-out node
+ * is resolved through the same cancellation handoff an interrupted wait
+ * uses, so a signal racing the expiry still wins (and reports success).
  */
-static int do_wait(struct event *evt, u64 *genp)
+static int do_wait(struct event *evt, u64 *genp, s64 timeout_ms)
 {
 	struct subscriber *sub;
+	ktime_t deadline;
 	int ret = 0;
+
+	if (timeout_ms >= 0)
+		deadline = ktime_add_ms(ktime_get(), timeout_ms);
 
 	if (genp) {
 		u64 cur = (u64)atomic64_read(&evt->gen);
@@ -245,7 +256,26 @@ static int do_wait(struct event *evt, u64 *genp)
 			break;
 		}
 
-		schedule();
+		if (timeout_ms < 0) {
+			schedule();
+		} else if (schedule_hrtimeout(&deadline, HRTIMER_MODE_ABS) ==
+			   0) {
+			/*
+			 * The deadline passed. One last look: a signal that
+			 * raced the expiry beats it. Otherwise resolve the
+			 * node exactly like a cancellation (it stays linked,
+			 * a later signal/release frees it) and report the
+			 * timeout. Losing the cancel means that racing
+			 * signal claimed us after all: success.
+			 */
+			if (smp_load_acquire(&sub->state) == EV_SIGNALED)
+				break;
+			if (subscriber_cancel(sub)) {
+				ret = -ETIMEDOUT;
+				sub = NULL; /* abandoned */
+			}
+			break;
+		}
 	}
 	__set_current_state(TASK_RUNNING);
 
@@ -329,7 +359,7 @@ static long event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 	case EVENT_IOC_WAIT:
-		return do_wait(evt, NULL);
+		return do_wait(evt, NULL, -1);
 	case EVENT_IOC_WAIT_GEN: {
 		u64 __user *ugen = (u64 __user *)arg;
 		u64 gen;
@@ -337,8 +367,25 @@ static long event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 		if (copy_from_user(&gen, ugen, sizeof(gen)))
 			return -EFAULT;
-		ret = do_wait(evt, &gen);
+		ret = do_wait(evt, &gen, -1);
 		if (!ret && copy_to_user(ugen, &gen, sizeof(gen)))
+			return -EFAULT;
+		return ret;
+	}
+	case EVENT_IOC_WAIT_EX: {
+		struct event_wait __user *uw = (struct event_wait __user *)arg;
+		struct event_wait w;
+		int ret;
+
+		if (copy_from_user(&w, uw, sizeof(w)))
+			return -EFAULT;
+		if ((w.flags & ~EVENT_WAIT_FL_GEN) || w.reserved)
+			return -EINVAL;
+		ret = do_wait(evt, (w.flags & EVENT_WAIT_FL_GEN) ? &w.gen :
+								   NULL,
+			      w.timeout_ms);
+		if ((ret == 0 || ret == -ETIMEDOUT) &&
+		    copy_to_user(uw, &w, sizeof(w)))
 			return -EFAULT;
 		return ret;
 	}
@@ -398,4 +445,4 @@ module_exit(event_exit);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
 MODULE_DESCRIPTION("Minimal event synchronization object (/dev/event), lock-free");
-MODULE_VERSION("3.1");
+MODULE_VERSION("3.2");

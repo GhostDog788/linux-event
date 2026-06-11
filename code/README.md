@@ -58,6 +58,8 @@ You compile and load `event.ko`. In your program you `#include "event.h"` (from
 | `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
 | `int wait_for_event(int evt)` | subscriber | Register the calling thread and block until the event is signaled. Returns 0 on wake. |
 | `int wait_for_event_gen(int evt, uint64_t *gen)` | subscriber | Like `wait_for_event`, but returns immediately if the event was signaled after generation `*gen` — a re-arming loop misses nothing. Updates `*gen`. |
+| `int wait_for_event_timeout(int evt, int64_t ms)` | subscriber | Bounded wait: `EVT_SIGNALED` on wake, `EVT_TIMEOUT` after `ms` milliseconds. `EVT_WAIT_FOREVER` / `EVT_WAIT_ZERO` for the extremes. |
+| `int wait_for_event_gen_timeout(int evt, uint64_t *gen, int64_t ms)` | subscriber | Generation-aware wait with a timeout — both of the above combined. |
 | `int signal_event(int evt)` | publisher | Wake every thread currently waiting. Returns the number woken. |
 | `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
 
