@@ -67,47 +67,86 @@ example wires up many listeners and one sender.
 `create_event()` is `open("/dev/event")`; each open allocates a fresh event in
 `file->private_data`. `wait_for_event` and `signal_event` are ioctls on that fd.
 
+The implementation is **lock-free**: the event holds a single `head` pointer
+to a LIFO list of subscriber nodes, and every shared access is one atomic
+operation — there is no spinlock anywhere.
+
 ```c
-/* wait_for_event(): register, then block until signaled. */
+/* wait_for_event(): register (one cmpxchg), then block until signaled. */
 static int wait_for_event(struct event *evt)
 {
-        struct subscriber sub = { .task = current, .signaled = false };
+        struct subscriber *sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
 
-        spin_lock(&evt->lock);
-        list_add_tail(&sub.node, &evt->subscribers);
-        spin_unlock(&evt->lock);
+        sub->task  = get_task_struct(current);
+        sub->state = EV_WAITING;
+
+        do {                              /* Treiber push onto the list head */
+                sub->next = READ_ONCE(evt->head);
+        } while (cmpxchg(&evt->head, sub->next, sub) != sub->next);
 
         for (;;) {
                 set_current_state(TASK_INTERRUPTIBLE);
-                spin_lock(&evt->lock);
-                if (sub.signaled) { spin_unlock(&evt->lock); break; }
-                spin_unlock(&evt->lock);
-                if (signal_pending(current)) return -ERESTARTSYS; /* + unlink */
+                if (smp_load_acquire(&sub->state) == EV_SIGNALED)
+                        break;            /* the signaler handed us the node */
+                if (signal_pending(current)) {
+                        if (cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED)
+                            == EV_WAITING)
+                                return -ERESTARTSYS;  /* node abandoned in place */
+                        break;            /* lost the race: we were signaled */
+                }
                 schedule();
         }
         __set_current_state(TASK_RUNNING);
-
-        spin_lock(&evt->lock);
-        list_del_init(&sub.node);   /* leave the list before returning */
-        spin_unlock(&evt->lock);
+        subscriber_free(sub);             /* we own it on the signaled path */
         return 0;
 }
 
-/* signal_event(): wake every registered subscriber. */
+/* signal_event(): claim the whole list with one xchg, wake every node. */
 static int signal_event(struct event *evt)
 {
-        struct subscriber *sub, *tmp;
+        struct subscriber *sub = xchg(&evt->head, NULL);   /* take-all */
+        int woken = 0;
 
-        spin_lock(&evt->lock);
-        list_for_each_entry_safe(sub, tmp, &evt->subscribers, node) {
-                list_del_init(&sub->node);
-                sub->signaled = true;
-                wake_up_process(sub->task);   /* -> TASK_RUNNING */
+        while (sub) {
+                struct subscriber *next = sub->next;       /* read BEFORE the */
+                struct task_struct *task = sub->task;      /* state handoff   */
+
+                get_task_struct(task);
+                if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
+                        wake_up_process(task);             /* waiter frees sub */
+                        woken++;
+                } else {
+                        subscriber_free(sub);              /* abandoned: ours */
+                }
+                put_task_struct(task);
+                sub = next;
         }
-        spin_unlock(&evt->lock);
-        return 0;
+        return woken;
 }
 ```
+
+Why this is safe without a lock:
+
+- **Take-all claiming.** `signal_event()` detaches the entire list with one
+  `xchg`, after which it owns every claimed node outright — concurrent
+  signalers get disjoint chains, and new waiters push onto the fresh empty
+  list (the event stays edge-triggered). Take-all is also what makes the
+  push-only `cmpxchg` immune to ABA.
+- **Ownership handoff by state.** The single atomic that moves a node out of
+  `EV_WAITING` decides who frees it: a signaler's `xchg → EV_SIGNALED` hands
+  the node to the waiter; an interrupted waiter's `cmpxchg → EV_CANCELLED`
+  abandons the node in place (it cannot be unlinked from the middle of the
+  list without a lock) for the next signal or the final `close()` to free.
+- **Task pinning.** Each node holds a `task_struct` reference, and the
+  signaler takes a temporary one of its own *before* publishing
+  `EV_SIGNALED`, so `wake_up_process()` can never race a waiter that wakes,
+  returns, and exits first.
+
+The cost of going lock-free: nodes are slab-allocated per wait rather than
+living on the waiter's stack (an interrupted waiter must be able to leave
+while its node is still linked), and a cancelled wait leaves one node behind
+until the next signal. Whether the trade wins is measured, not argued —
+see [Benchmarking](#benchmarking-an-implementation-iteration) below.
 
 See `module/event.c` for the full, commented source.
 
@@ -189,31 +228,39 @@ protocol and what each metric means live in [`bench/README.md`](bench/README.md)
 ## What changed from the original design
 
 This object began as a paper design (`event - kernel.md`): the right idea — a
-subscriber list with park-then-wake — but with racy kernel pseudo-code. The
-implementation here keeps that structure and fixes three real bugs from the
-original sketch:
+subscriber list with park-then-wake, maintained with **atomic operations
+instead of a lock** — but with racy kernel pseudo-code. This implementation
+keeps the lock-free intent and fixes three real bugs from the original
+sketch:
 
 1. **The registration loop never linked the node.** The original walked the
-   list with `end = atomic_cmpxchg(end, NULL, sub)` and `end = end.next`, which
-   neither appends `sub` nor terminates correctly. Here registration is a plain
-   `list_add_tail` under a spinlock — simple and correct.
+   list with `end = atomic_cmpxchg(end, NULL, sub)` and `end = end.next`,
+   which neither appends `sub` nor terminates correctly. Appending at the
+   *tail* is the hard way; pushing at the *head* makes registration a single
+   correct `cmpxchg` (a Treiber push), and a wake-all event doesn't care
+   about list order anyway.
 
 2. **No wakeup-condition loop → lost wakeups and spurious returns.** The
    original did `set_current_state(...); schedule();` once, with nothing to
    re-check. A signal landing between "add to list" and `schedule()` would be
    lost, and any spurious wake would return as if signaled. The fix is the
-   standard pattern: set the task state *before* re-checking a `signaled` flag
-   under the lock, loop on `schedule()`, and honor `signal_pending()`.
+   standard pattern: set the task state *before* re-checking the node's
+   state, loop on `schedule()`, and honor `signal_pending()`.
 
 3. **Use-after-free in `signal_event`.** The original `kfree(sub)`'d each
-   subscriber while the waiter still referenced it. Here the subscriber struct
-   lives on the **waiter's own kernel stack** (valid for exactly as long as the
-   thread is blocked), so signaling only unlinks + wakes and never frees — and
-   the waiter unlinks itself before returning, so the publisher never touches a
-   stack that's going away.
+   subscriber while the waiter still referenced it (and while it could still
+   be mid-wake). Without a lock, "don't free while someone looks" becomes an
+   ownership problem; here a per-node atomic state transition decides exactly
+   who frees each node, and task references make the wake itself safe — see
+   *Inside the kernel* above.
+
+(An earlier iteration of this module fixed the same three bugs with a
+spinlocked `list_head` and stack-resident nodes — `git log module/event.c`
+has it. The benchmark in `bench/` is how the two are judged against each
+other.)
 
 The net effect matches the design's intent — block with no polling, wake all
-subscribers on signal — without the races.
+subscribers on signal, no lock anywhere — without the races.
 
 ## License
 
