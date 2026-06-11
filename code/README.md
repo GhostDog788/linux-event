@@ -57,8 +57,7 @@ You compile and load `event.ko`. In your program you `#include "event.h"` (from
 | Function | Role | Meaning |
 | --- | --- | --- |
 | `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
-| `int wait_for_event(int evt, uint64_t *gen)` | subscriber | Block until the event is signaled past `*gen` — immediately if it already has been. Start with `*gen = 0`; updated on return. |
-| `int wait_for_event_timeout(int evt, uint64_t *gen, int64_t ms)` | subscriber | The same, bounded: `EVT_SIGNALED` on wake, `EVT_TIMEOUT` after `ms` milliseconds. `EVT_WAIT_FOREVER` / `EVT_WAIT_ZERO` for the extremes. |
+| `int wait_for_event(int evt, uint64_t *gen, int64_t timeout_ms)` | subscriber | Block until the event is signaled past `*gen` — immediately if it already has been — or until `timeout_ms` expires. Returns `EVT_SIGNALED` (with `*gen` updated; start it at 0) or `EVT_TIMEOUT`. Pass `EVT_WAIT_FOREVER` to never time out, `EVT_WAIT_ZERO` to poll. |
 | `int signal_event(int evt)` | publisher | Bump the generation and wake every thread currently waiting. Returns the number woken. |
 | `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
 
@@ -153,6 +152,11 @@ static int signal_event(struct event *evt)
 
 Why this is safe without a lock:
 
+- **Generation ordering.** The counter is bumped before the list is claimed,
+  and every path that could observe the signal passes through a fully-ordered
+  atomic (the claim's `xchg`, the waiter's registration `cmpxchg`, the state
+  handoff) — so no waiter can park against a generation that has already
+  moved, and no late waiter can read a pre-signal value after registering.
 - **Take-all claiming.** `signal_event()` detaches the entire list with one
   `xchg`, after which it owns every claimed node outright — concurrent
   signalers get disjoint chains, and new waiters push onto the fresh empty

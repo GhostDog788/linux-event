@@ -284,7 +284,7 @@ static void event_teardown(struct ctx *c)
 
 static void event_wait_op(struct ctx *c, uint64_t *gen)
 {
-	if (wait_for_event(c->fd, gen) != 0)
+	if (wait_for_event(c->fd, gen, EVT_WAIT_FOREVER) != EVT_SIGNALED)
 		die("wait_for_event: %s", strerror(errno));
 }
 

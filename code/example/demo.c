@@ -36,7 +36,7 @@ static int run_listener(int evt, int id)
 	       (int)getpid());
 	fflush(stdout);
 
-	if (wait_for_event(evt, &gen) != 0) {
+	if (wait_for_event(evt, &gen, EVT_WAIT_FOREVER) != EVT_SIGNALED) {
 		fprintf(stderr,
 			"  [listener %d | pid %d] wait_for_event failed: %s\n",
 			id, (int)getpid(), strerror(errno));
