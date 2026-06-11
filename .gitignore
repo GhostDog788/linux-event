@@ -35,3 +35,6 @@ modules.order
 CLAUDE.md
 session.md
 todo.md
+
+# Python bytecode (compare.py).
+__pycache__/

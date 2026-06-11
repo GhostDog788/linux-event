@@ -1,9 +1,9 @@
-# `bench` — measuring event implementations against each other
+# `bench`: measuring event implementations against each other
 
 `event.ko` will go through many implementation iterations. This directory is
 the fixed yardstick they are all measured with: a benchmark binary (`bench.c`)
-that produces raw samples, and a verdict tool (`compare.py`) that says — with
-statistical backing — whether iteration B beats iteration A, **and in which
+that produces raw samples, and a verdict tool (`compare.py`) that says, with
+statistical backing, whether iteration B beats iteration A, **and in which
 regime**.
 
 ## The protocol
@@ -32,16 +32,16 @@ Rules that make the result definitive rather than anecdotal:
 1. **Same machine, back to back, otherwise idle.** Absolute numbers from
    different machines (or the same VM on different days) are not comparable.
 2. **Trust the control.** Every run also measures a *futex generation-counter*
-   implementation of the same object — kernel-native code our module never
+   implementation of the same object, kernel-native code our module never
    touches. If `compare.py` reports the futex rows shifted significantly, the
    machine conditions changed between runs and the event verdicts are void.
    Re-run both sides. (This is automatic; the script prints a loud warning.)
 3. **A difference is real only if the test says so.** `compare.py` runs a
    Mann-Whitney U test per cell and only prints BETTER/WORSE when p < 0.01
-   *and* the median moved ≥ 3%. Everything else is `~` — treat it as a tie.
+   *and* the median moved ≥ 3%. Everything else is `~`; treat it as a tie.
 4. **Watch `invalid_rounds`.** The harness independently verifies that every
    signal woke exactly the number of waiters that were parked. A nonzero
-   count means the candidate has a registration race — a correctness bug.
+   count means the candidate has a registration race, a correctness bug.
    No performance number excuses that.
 5. **`scripts/06-bench.sh` labels every CSV with `git describe --dirty`** and
    warns if the module loaded on the target is not the one last built, so a
@@ -57,7 +57,7 @@ Rules that make the result definitive rather than anecdotal:
 | `churn` | `wakes_per_sec` | sustained subscribers-woken throughput with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
 | `churn` | `empty_signal_pct` | how often the publisher found nobody parked | diagnostic: high % = waiters re-arm slower than the publisher signals |
 | `churn` | `waiter_wakes` | per-waiter wake counts | fairness: one starved waiter shows up as a low outlier |
-| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"** — set `-P`/`-W` to your real workload's numbers |
+| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; set `-P`/`-W` to your real workload's numbers |
 | `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced into its next wait's generation jump) | listeners running behind the publisher; an edge-triggered design would silently *lose* these events |
 | `signal0` | `signal0_ns` | signal cost with zero subscribers | events that are mostly idle ("publish and nobody listens") |
 | `open` | `open_close_ns` | create + destroy cost | short-lived events created per request |
@@ -65,19 +65,19 @@ Rules that make the result definitive rather than anecdotal:
 So "which implementation is better **and when**" reads directly off the
 compare table: an iteration might win `wake n=1` (cheaper single wake) but
 lose `signal_call_ns n=256` (worse fan-out) and `churn wakes_per_sec`
-(more lock contention) — pick by the regime your workload lives in, and the
+(more lock contention); pick by the regime your workload lives in, and the
 sweep (`-N`) shows where the crossover sits.
 
 ## How the harness keeps rounds honest
 
 A `wake` round only measures wake-up latency if every waiter is actually
-parked in the kernel before the signal — a waiter that returned instantly
+parked in the kernel before the signal; a waiter that returned instantly
 off the generation counter measures nothing, and a naive bench would race
 and silently mix the two. Each round therefore:
 
 1. waits for every waiter to announce readiness (userspace atomic),
 2. polls `/proc/self/task/<tid>/stat` until every waiter thread is in state
-   `S` — by that point it is registered, because both event.ko and futex
+   `S`; by that point it is registered, because both event.ko and futex
    enqueue *before* marking the task sleeping,
 3. timestamps, signals once, and **checks the signal's return value
    (waiters woken) equals n**. A short round is released, discarded, and
@@ -86,7 +86,7 @@ and silently mix the two. Each round therefore:
 Step 3 is intentionally implementation-agnostic: if a future iteration
 registers waiters in some way that breaks assumption 2, the round is dropped
 loudly instead of polluting the data. It does rely on the uapi contract that
-`EVENT_IOC_SIGNAL` returns the number of waiters woken — keep that contract,
+`EVENT_IOC_SIGNAL` returns the number of waiters woken; keep that contract
 or teach the harness otherwise.
 
 Other choices worth knowing:
@@ -95,14 +95,14 @@ Other choices worth knowing:
   wake path is identical (`wake_up_process` on a task); threads just make
   cross-waiter timestamps and round barriers cheap and exact.
 - Timestamps are `CLOCK_MONOTONIC`; `wake_ns` includes the signal ioctl's own
-  entry cost — that is deliberate: it is the latency the *system* delivers
+  entry cost; that is deliberate: it is the latency the *system* delivers
   from the publisher's decision to the waiter running.
 - The first `max(3, rounds/10)` rounds per combination are warmup and
   discarded.
 - In `churn`, throughput is counted publisher-side from the signal's return
   value ("parked waiters woken per second"). Per-waiter counts can run
   higher than that because a waiter that observes the generation move before
-  parking never sleeps — its deliveries don't appear in the signal's return.
+  parking never sleeps; its deliveries don't appear in the signal's return.
   Compare `wakes_per_sec` across implementations; treat `waiter_wakes` as a
   fairness signal within one implementation.
 - `-p <cpu>` pins the publisher for steadier `signal_call_ns` numbers; use it

@@ -12,7 +12,7 @@ medians, p99s, the relative delta, and a verdict.
 The verdict is statistical, not eyeballed: a two-sided Mann-Whitney U test
 (normal approximation with tie correction) on the raw samples. A cell is
 called BETTER/WORSE only when p < ALPHA *and* the median moved by more than
-MIN_EFFECT -- otherwise it is '~' (no meaningful difference). This is what
+MIN_EFFECT, otherwise it is '~' (no meaningful difference). This is what
 makes the comparison definitive: run-to-run scheduler noise fails the test,
 real regressions do not.
 
@@ -113,7 +113,7 @@ def main():
     keys = sorted(set(base) & set(cand))
     if not keys:
         sys.exit("the two files share no (scenario, impl, waiters, metric) "
-                 "cells -- were they produced with the same bench options?")
+                 "cells, were they produced with the same bench options?")
     only = sorted(set(base) ^ set(cand))
     if only:
         print(f"note: {len(only)} cell(s) present in only one file are "
@@ -166,7 +166,7 @@ def main():
                if k[3] == "invalid_rounds" and sum(v) > 0}
         for (scenario, impl, waiters, _), v in sorted(bad.items()):
             print(f"\nWARNING: {name} had {int(sum(v))} invalid {scenario} "
-                  f"round(s) for {impl} n={waiters} -- the implementation "
+                  f"round(s) for {impl} n={waiters}, the implementation "
                   f"woke fewer waiters than were parked (registration race).")
 
     if control_shifted:

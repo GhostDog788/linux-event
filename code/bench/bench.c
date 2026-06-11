@@ -14,7 +14,7 @@
  *   - runs every scenario against a *futex generation-counter* baseline as
  *     well. The futex numbers are the experiment's control: the kernel's
  *     native primitive doing the same job, untouched by our module. Between
- *     two runs on the same machine they should not move -- if they do, the
+ *     two runs on the same machine they should not move; if they do, the
  *     machine was not quiet and the event-vs-event comparison is invalid,
  *   - dumps every raw sample to CSV (-c) so compare.py can attach
  *     percentiles and a significance test to the A/B verdict.
@@ -24,7 +24,7 @@
  *   wake     One publisher signals N parked waiters, -r rounds per N.
  *            Metrics per round: wake_ns (one sample per waiter: time from
  *            just-before-signal to that waiter running again), last_wake_ns
- *            (time until the *slowest* waiter is running -- fan-out
+ *            (time until the *slowest* waiter is running, fan-out
  *            completion), signal_call_ns (how long the publisher is stuck
  *            inside signal_event() itself).
  *
@@ -32,7 +32,7 @@
  *            as fast as it can for -d seconds: sustained throughput and
  *            lock contention. Metrics per rep: wakes_per_sec,
  *            signal_calls_per_sec, empty_signal_pct (publisher found no
- *            one waiting -- how fast waiters re-arm), waiter_wakes (one
+ *            one waiting, how fast waiters re-arm), waiter_wakes (one
  *            sample per waiter: fairness of the wake distribution).
  *
  *   loop     The realistic subscriber loop: N waiters each wait, simulate
@@ -200,8 +200,8 @@ static void csv_emit(const char *scenario, const char *impl, int waiters,
  *
  * State is the field after the last ')' of the comm in
  * /proc/self/task/<tid>/stat. 'S' (interruptible sleep) for one of our waiter
- * threads -- which between announcing readiness and blocking executes nothing
- * that sleeps -- means it has entered the implementation's wait path and is
+ * threads, which between announcing readiness and blocking executes nothing
+ * that sleeps, means it has entered the implementation's wait path and is
  * registered (both event.ko and futex enqueue before marking the task
  * sleeping).
  */
@@ -235,7 +235,7 @@ static void wait_all_parked(const pid_t *tids, int n, const char *who)
 	for (i = 0; i < n; i++) {
 		while (task_state(tids[i]) != 'S') {
 			if (now_ns() > deadline)
-				die("%s: waiter %d (tid %d) never parked -- "
+				die("%s: waiter %d (tid %d) never parked, "
 				    "implementation under test looks stuck",
 				    who, i, (int)tids[i]);
 			sched_yield();
@@ -246,8 +246,8 @@ static void wait_all_parked(const pid_t *tids, int n, const char *who)
 /* --- implementations under test --------------------------------------------
  *
  * Both share one shape, mirroring the event ABI: wait(&gen) returns once
- * the object has been signaled past *gen -- immediately if it already has,
- * else by parking -- and writes the current generation back; signal_all()
+ * the object has been signaled past *gen, immediately if it already has,
+ * else by parking, and writes the current generation back; signal_all()
  * wakes everyone and returns how many were parked. A waiter that carries
  * its gen between calls can never lose a signal, which is also what makes
  * the harness race-free by construction.
@@ -483,7 +483,7 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 		while (woken < n) {
 			if (now_ns() > spin_deadline)
 				die("wake/%s n=%d round %d: only %d/%d woken "
-				    "and stragglers won't wake -- lost waiter",
+				    "and stragglers won't wake: lost waiter",
 				    impl->name, n, r, woken, n);
 			woken += impl->signal_all(sh.ctx);
 			sh.cur_gen++;
@@ -531,7 +531,7 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 	       vec_pct(&sig, 50) / 1e3);
 	if (invalid)
 		printf("        ^^^ %d invalid round%s: signal woke fewer "
-		       "waiters than were parked -- registration race?\n",
+		       "waiters than were parked, registration race?\n",
 		       invalid, invalid == 1 ? "" : "s");
 	csv_emit("wake", impl->name, n, -1, "invalid_rounds", invalid);
 
@@ -549,7 +549,7 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 
 /* --- scenario: churn (sustained throughput under contention) ---------------
  *
- * No round gating here -- waiters re-arm as fast as they can and the
+ * No round gating here, waiters re-arm as fast as they can and the
  * publisher signals as fast as it can, which is exactly the registration /
  * signal lock contention we want to stress. Throughput is counted on the
  * publisher side from signal_all()'s return value, over the timed window
@@ -639,7 +639,7 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 		drain_deadline = now_ns() + STUCK_TIMEOUT_NS;
 		while (atomic_load(&sh.exited) < n) {
 			if (now_ns() > drain_deadline)
-				die("churn/%s n=%d: waiters won't drain -- "
+				die("churn/%s n=%d: waiters won't drain, "
 				    "lost wakeup in the implementation?",
 				    impl->name, n);
 			impl->signal_all(sh.ctx);
@@ -692,7 +692,7 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
  * listeners on one event": the generation guarantees a listener that was
  * still working when a signal fired sees it on the next call instead of
  * sleeping into the void, and the bench counts exactly how often that
- * happened (missed_signals -- with an edge-triggered design every one of
+ * happened (missed_signals, with an edge-triggered design every one of
  * those would be a silently lost event).
  *
  * Latency accounting: the publisher stamps each generation g in a ring just
@@ -700,7 +700,7 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
  * parked when that signal fired, so (now - ring[g]) is true wake latency.
  * A jump (gen > prev+1) means the waiter worked through >= 1 signal: the
  * skipped ones count as missed, and no latency sample is taken (the waiter
- * wasn't waiting -- there is nothing to time).
+ * wasn't waiting, there is nothing to time).
  */
 
 #define LOOP_RING 65536 /* power of two; >> any realistic lag in signals */

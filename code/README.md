@@ -1,4 +1,4 @@
-# `event` — non-busy blocking on an event
+# `event`: non-busy blocking on an event
 
 A small Linux kernel object that lets one or more threads **block until an
 event fires**, with *zero* polling latency and *zero* wasted CPU cycles.
@@ -6,7 +6,7 @@ event fires**, with *zero* polling latency and *zero* wasted CPU cycles.
 ## The problem
 
 You have a condition (classically: "a global boolean became true") and you want
-a thread to wait for it. Polling — check, sleep, check again — trades latency
+a thread to wait for it. Polling (check, sleep, check again) trades latency
 for CPU: the shorter your sleep, the more responsive the wait but the more
 cycles you burn. The `event` object removes the trade-off entirely. A waiter
 sleeps in the kernel and is woken the instant the event is signaled.
@@ -18,13 +18,13 @@ sleeps in the kernel and is woken the instant the event is signaled.
 - A **subscriber** registers the calling thread and parks it
   (`TASK_INTERRUPTIBLE`), so it consumes no CPU while waiting.
 - A **publisher** signals the event, which walks the subscriber list and sets
-  every parked thread back to `TASK_RUNNING` — waking them all at once.
+  every parked thread back to `TASK_RUNNING`, waking them all at once.
 
 Signals are **counted**: every `signal_event()` bumps the event's generation,
 and a wait carries the generation its caller last observed. An up-to-date
 waiter parks until the next signal; a waiter that was busy when a signal
 fired returns immediately on its next wait. So a wait/work/re-arm loop
-observes every signal, no matter how late it re-arms — a burst during one
+observes every signal, no matter how late it re-arms. A burst during one
 stretch of work coalesces into a single return with the generation jumped by
 the burst size.
 
@@ -32,7 +32,7 @@ the burst size.
 
 ```
 code/
-├── module/          the kernel module — builds event.ko
+├── module/          the kernel module, builds event.ko
 │   ├── event.c          char-device driver exposing /dev/event
 │   ├── event_uapi.h     the ioctl ABI (shared, in spirit, with the lib)
 │   └── Makefile         out-of-tree kbuild
@@ -51,13 +51,13 @@ code/
 ## The API
 
 You compile and load `event.ko`. In your program you `#include "event.h"` (from
-`lib/`) and link nothing — every function is a `static inline` wrapper around an
+`lib/`) and link nothing: every function is a `static inline` wrapper around an
 `ioctl` on the `/dev/event` device the driver exposes.
 
 | Function | Role | Meaning |
 | --- | --- | --- |
 | `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
-| `int wait_for_event(int evt, uint64_t *gen, int64_t timeout_ms)` | subscriber | Block until the event is signaled past `*gen` — immediately if it already has been — or until `timeout_ms` expires. Returns `EVT_SIGNALED` (with `*gen` updated; start it at 0) or `EVT_TIMEOUT`. Pass `EVT_WAIT_FOREVER` to never time out, `EVT_WAIT_ZERO` to poll. |
+| `int wait_for_event(int evt, uint64_t *gen, int64_t timeout_ms)` | subscriber | Block until the event is signaled past `*gen`, immediately if it already has been, or until `timeout_ms` expires. Returns `EVT_SIGNALED` (with `*gen` updated; start it at 0) or `EVT_TIMEOUT`. Pass `EVT_WAIT_FOREVER` to never time out, `EVT_WAIT_ZERO` to poll. |
 | `int signal_event(int evt)` | publisher | Bump the generation and wake every thread currently waiting. Returns the number woken. |
 | `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
 
@@ -73,10 +73,10 @@ example wires up many listeners and one sender.
 
 The implementation is **lock-free**: the event holds a single `head` pointer
 to a LIFO list of subscriber nodes, and every shared access is one atomic
-operation — there is no spinlock anywhere.
+operation; there is no spinlock anywhere.
 
 ```c
-/* do_wait(): return once the event is signaled past w->gen -- immediately
+/* do_wait(): return once the event is signaled past w->gen, immediately
  * if it already has been, else register (one cmpxchg) and park. */
 static int do_wait(struct event *evt, struct event_wait *w)
 {
@@ -155,23 +155,23 @@ Why this is safe without a lock:
 - **Generation ordering.** The counter is bumped before the list is claimed,
   and every path that could observe the signal passes through a fully-ordered
   atomic (the claim's `xchg`, the waiter's registration `cmpxchg`, the state
-  handoff) — so no waiter can park against a generation that has already
+  handoff), so no waiter can park against a generation that has already
   moved, and no late waiter can read a pre-signal value after registering.
 - **Take-all claiming.** `signal_event()` detaches the entire list with one
-  `xchg`, after which it owns every claimed node outright — concurrent
+  `xchg`, after which it owns every claimed node outright, concurrent
   signalers get disjoint chains, and new waiters push onto the fresh empty
   list and catch up through the generation. Take-all is also what makes the
   push-only `cmpxchg` immune to ABA.
 - **Ownership handoff by state.** The single atomic that moves a node out of
   `EV_WAITING` decides who frees it: a signaler's `xchg → EV_SIGNALED` hands
-  the node to the waiter; a waiter that leaves early — interrupting POSIX
-  signal, timeout, or a generation bump that raced past its registration —
+  the node to the waiter; a waiter that leaves early, interrupting POSIX
+  signal, timeout, or a generation bump that raced past its registration,
   wins it back with `cmpxchg → EV_CANCELLED` and abandons it in place (it
   cannot be unlinked from the middle of the list without a lock) for the
   next signal or the final `close()` to free.
 - **RCU-protected wakes, no refcounting.** A node still `EV_WAITING` at the
   signaler's `xchg` proves its waiter was inside `wait_for_event()` at that
-  instant — it cannot return (let alone exit) before observing
+  instant, it cannot return (let alone exit) before observing
   `EV_SIGNALED`, which only this signaler publishes. The task's
   `release_task()` therefore happens *inside* the signaler's RCU read
   section, and a `task_struct` is freed only one RCU grace period after
@@ -183,7 +183,7 @@ Why this is safe without a lock:
 The cost of going lock-free: nodes are slab-allocated per wait rather than
 living on the waiter's stack (an interrupted waiter must be able to leave
 while its node is still linked), and a cancelled wait leaves one node behind
-until the next signal. Whether the trade wins is measured, not argued —
+until the next signal. Whether the trade wins is measured, not argued;
 see [Benchmarking](#benchmarking-an-implementation-iteration) below.
 
 See `module/event.c` for the full, commented source.
@@ -208,14 +208,14 @@ make
 sudo rmmod event
 ```
 
-Expected output (order of the wake-ups varies — they all unblock together):
+Expected output (order of the wake-ups varies; they all unblock together):
 
 ```
 [sender | pid 1234] created event (fd 3), spawning 5 listeners
   [listener 0 | pid 1235] waiting for the event...
   [listener 1 | pid 1236] waiting for the event...
   ...
-[sender | pid 1234] signaling the event -- waking all listeners
+[sender | pid 1234] signaling the event, waking all listeners
   [listener 0 | pid 1235] >>> woke up, event received!
   [listener 2 | pid 1237] >>> woke up, event received!
   ...
@@ -243,15 +243,15 @@ NAT'd VM with no extra port-forwarding. Knobs (env vars read by
 `scripts/05-debug-user.sh`): `USERDEBUG_PORT` (port, default 2345), `DEMO_ARGS`
 (listener count, default 3).
 
-The debugger follows the **sender** (the parent) by default — that's the path
+The debugger follows the **sender** (the parent) by default; that's the path
 that calls `signal_event()`. The listeners are forked children; to break inside
 one, run `set follow-fork-mode child` in the Debug Console before continuing.
 
 ## Benchmarking an implementation iteration
 
 The implementation in `module/event.c` is meant to be iterated on. Whether an
-iteration is actually *better* — and in which regime (single waiter, large
-fan-out, high churn) — is decided by the benchmark in [`bench/`](bench/), not
+iteration is actually *better*, and in which regime (single waiter, large
+fan-out, high churn), is decided by the benchmark in [`bench/`](bench/), not
 by eyeballing:
 
 ```bash
@@ -266,9 +266,9 @@ protocol and what each metric means live in [`bench/README.md`](bench/README.md)
 
 ## What changed from the original design
 
-This object began as a paper design (`event - kernel.md`): the right idea — a
+This object began as a paper design (`event - kernel.md`): the right idea, a
 subscriber list with park-then-wake, maintained with **atomic operations
-instead of a lock** — but with racy kernel pseudo-code. This implementation
+instead of a lock**, but with racy kernel pseudo-code. This implementation
 keeps the lock-free intent and fixes three real bugs from the original
 sketch:
 
@@ -290,17 +290,17 @@ sketch:
    subscriber while the waiter still referenced it (and while it could still
    be mid-wake). Without a lock, "don't free while someone looks" becomes an
    ownership problem; here a per-node atomic state transition decides exactly
-   who frees each node, and task references make the wake itself safe — see
+   who frees each node, and task references make the wake itself safe; see
    *Inside the kernel* above.
 
 (An earlier iteration of this module fixed the same three bugs with a
-spinlocked `list_head` and stack-resident nodes — `git log module/event.c`
+spinlocked `list_head` and stack-resident nodes, `git log module/event.c`
 has it. The benchmark in `bench/` is how the two are judged against each
 other.)
 
-The net effect matches the design's intent — block with no polling, wake all
-subscribers on signal, no lock anywhere — without the races.
+The net effect matches the design's intent: block with no polling, wake all
+subscribers on signal, no lock anywhere, without the races.
 
 ## License
 
-MIT — see [../LICENSE](../LICENSE).
+MIT; see [../LICENSE](../LICENSE).

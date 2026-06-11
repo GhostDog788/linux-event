@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build, deploy, and run the event benchmark (code/bench) on <target>, then
 # fetch the raw-sample CSV back into results/, named by the git revision the
-# tree was at -- so every implementation iteration leaves a comparable,
+# tree was at, so every implementation iteration leaves a comparable,
 # attributable artifact:
 #
 #   scripts/06-bench.sh server                      # full default sweep
@@ -12,7 +12,7 @@
 #
 # The benchmark needs /dev/event on the target; like scripts/05, this script
 # insmods the built event.ko if the device is missing. It does NOT rebuild or
-# reload the module if it is already loaded -- after changing event.c, run
+# reload the module if it is already loaded; after changing event.c, run
 # scripts/03-build-module.sh and scripts/04-deploy-and-prep-gdb.sh (or rmmod
 # on the target) first, or you will benchmark the OLD implementation. The
 # script warns when the loaded module's srcversion differs from the built .ko.
@@ -62,7 +62,7 @@ elif [[ -n "$ko" && -f "$ko" ]]; then
 	loaded_src="$(lab_ssh "cat /sys/module/event/srcversion 2>/dev/null" || true)"
 	if [[ -n "$built_src" && -n "$loaded_src" && "$built_src" != "$loaded_src" ]]; then
 		echo "WARNING: the event.ko loaded on the target ($loaded_src) is not the" >&2
-		echo "         one last built ($built_src) -- you are about to benchmark a" >&2
+		echo "         one last built ($built_src); you are about to benchmark a" >&2
 		echo "         STALE implementation. Reload it first:" >&2
 		echo "           scripts/04-deploy-and-prep-gdb.sh $target <method>" >&2
 	fi

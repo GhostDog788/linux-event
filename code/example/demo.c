@@ -12,7 +12,7 @@
  * Everyone prints to the screen so you can watch the listeners block and then
  * wake together.
  *
- * Build:  make           (see Makefile -- pulls in ../lib/event.h)
+ * Build:  make           (see Makefile, pulls in ../lib/event.h)
  * Run:    ./demo [num_listeners]      (default 5; requires event.ko loaded)
  */
 
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
 	 */
 	sleep(1);
 
-	printf("[sender | pid %d] signaling the event -- waking all listeners\n",
+	printf("[sender | pid %d] signaling the event, waking all listeners\n",
 	       (int)getpid());
 	if (signal_event(evt) < 0) {
 		fprintf(stderr, "signal_event failed: %s\n", strerror(errno));

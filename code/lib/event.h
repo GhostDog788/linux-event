@@ -51,7 +51,7 @@ static inline int create_event(void)
 
 /*
  * Block, consuming no CPU, until the event is signaled past *gen --
- * immediately if it already has been -- or until timeout_ms expires.
+ * immediately if it already has been, or until timeout_ms expires.
  * Start with *gen = 0; it is updated on EVT_SIGNALED, so a wait/work/re-arm
  * loop observes every signal no matter how late it re-arms.
  *

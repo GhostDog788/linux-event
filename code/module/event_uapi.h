@@ -4,8 +4,8 @@
  * ../lib/event.h redefines these to stay standalone; keep the two in sync.
  *
  * Signals are counted in a per-event generation (0 at creation). A wait
- * returns once the event is signaled past ->gen -- immediately if it
- * already has been -- and writes the current generation back, so a
+ * returns once the event is signaled past ->gen, immediately if it
+ * already has been, and writes the current generation back, so a
  * wait/work/re-arm loop never misses a signal.
  */
 #ifndef EVENT_UAPI_H

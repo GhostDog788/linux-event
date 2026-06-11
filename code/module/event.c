@@ -53,7 +53,7 @@ static struct kmem_cache *subscriber_cache;
 
 /* True: the node is now abandoned (EV_CANCELLED) for a later signal or
  * release to free; the caller must not touch it again. False: a signaler
- * got there first -- we are signaled and the node is ours. */
+ * got there first; we are signaled and the node is ours. */
 static bool subscriber_cancel(struct subscriber *sub)
 {
 	return cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) == EV_WAITING;
@@ -124,7 +124,7 @@ static int do_wait(struct event *evt, struct event_wait *w)
 
 	for (;;) {
 		/* State first, checks second: a signaler either sees us
-		 * parked or we see its update -- no lost wakeup. */
+		 * parked or we see its update; no lost wakeup. */
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		if (smp_load_acquire(&sub->state) == EV_SIGNALED)
