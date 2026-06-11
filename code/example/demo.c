@@ -25,7 +25,7 @@
 
 #include "event.h"
 
-#define DEFAULT_LISTENERS 4000
+#define DEFAULT_LISTENERS 5
 
 /* Child path: register on the event, block, then report the wake-up. */
 static int run_listener(int evt, int id)
