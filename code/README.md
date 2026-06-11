@@ -77,7 +77,7 @@ static int wait_for_event(struct event *evt)
 {
         struct subscriber *sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
 
-        sub->task  = get_task_struct(current);
+        sub->task  = current;             /* no refcount: RCU protects the wake */
         sub->state = EV_WAITING;
 
         do {                              /* Treiber push onto the list head */
@@ -97,30 +97,35 @@ static int wait_for_event(struct event *evt)
                 schedule();
         }
         __set_current_state(TASK_RUNNING);
-        subscriber_free(sub);             /* we own it on the signaled path */
+        kmem_cache_free(subscriber_cache, sub);  /* ours on the signaled path */
         return 0;
 }
 
 /* signal_event(): claim the whole list with one xchg, wake every node. */
 static int signal_event(struct event *evt)
 {
-        struct subscriber *sub = xchg(&evt->head, NULL);   /* take-all */
+        struct subscriber *sub, *next;
         int woken = 0;
 
-        while (sub) {
-                struct subscriber *next = sub->next;       /* read BEFORE the */
-                struct task_struct *task = sub->task;      /* state handoff   */
+        if (!READ_ONCE(evt->head))                /* common case: nobody is   */
+                return 0;                         /* waiting; don't dirty the */
+                                                  /* cacheline with an xchg   */
+        sub = xchg(&evt->head, NULL);             /* take-all */
 
-                get_task_struct(task);
+        rcu_read_lock();                          /* makes the wakes safe     */
+        while (sub) {
+                struct task_struct *task = sub->task;
+
+                next = sub->next;                 /* read BEFORE the handoff  */
                 if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
-                        wake_up_process(task);             /* waiter frees sub */
+                        wake_up_process(task);    /* waiter frees sub         */
                         woken++;
                 } else {
-                        subscriber_free(sub);              /* abandoned: ours */
+                        kmem_cache_free(subscriber_cache, sub); /* abandoned  */
                 }
-                put_task_struct(task);
                 sub = next;
         }
+        rcu_read_unlock();
         return woken;
 }
 ```
@@ -137,10 +142,16 @@ Why this is safe without a lock:
   the node to the waiter; an interrupted waiter's `cmpxchg → EV_CANCELLED`
   abandons the node in place (it cannot be unlinked from the middle of the
   list without a lock) for the next signal or the final `close()` to free.
-- **Task pinning.** Each node holds a `task_struct` reference, and the
-  signaler takes a temporary one of its own *before* publishing
-  `EV_SIGNALED`, so `wake_up_process()` can never race a waiter that wakes,
-  returns, and exits first.
+- **RCU-protected wakes, no refcounting.** A node still `EV_WAITING` at the
+  signaler's `xchg` proves its waiter was inside `wait_for_event()` at that
+  instant — it cannot return (let alone exit) before observing
+  `EV_SIGNALED`, which only this signaler publishes. The task's
+  `release_task()` therefore happens *inside* the signaler's RCU read
+  section, and a `task_struct` is freed only one RCU grace period after
+  `release_task()`, so `wake_up_process()` can never touch freed memory.
+  (The same argument the kernel's `rcuwait` relies on; earlier iterations
+  paid a `get/put_task_struct` pair per node instead, which dominated large
+  fan-outs.)
 
 The cost of going lock-free: nodes are slab-allocated per wait rather than
 living on the waiter's stack (an interrupted waiter must be able to leave

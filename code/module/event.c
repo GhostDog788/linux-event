@@ -17,19 +17,19 @@
  * children inherit the *same* event object across a fork -- which is exactly
  * how the example wires up many listeners and one sender.
  *
- * LOCK-FREE DESIGN -- this iteration takes no lock anywhere; every shared
- * access is a single atomic operation. This is the original paper design's
- * intent (an atomic_cmpxchg'd subscriber list) done correctly:
+ * LOCK-FREE DESIGN (iteration 3) -- no lock anywhere; every shared access is
+ * a single atomic operation:
  *
  *  - Registration is a Treiber push: one cmpxchg() swings the list head to
- *    the new node. Pushing at the head (not appending at the tail, as the
- *    paper sketched) is what makes a single cmpxchg sufficient.
+ *    the new node.
  *
  *  - signal_event() claims the ENTIRE list with one xchg(head, NULL) and
  *    then owns every claimed node outright -- no other signaler, and no new
  *    waiter, can reach them. Take-all claiming is also what makes the
  *    push-only cmpxchg ABA-safe: a recycled node address can only reappear
- *    at the head by being legitimately pushed again.
+ *    at the head by being legitimately pushed again. An empty event is
+ *    detected with a plain read first, so the (common) signal-with-no-
+ *    subscribers case never dirties the shared cacheline.
  *
  *  - Lifetime is a three-state handoff instead of a lock. Each node holds
  *    an atomic state, and the single xchg()/cmpxchg() that moves it out of
@@ -44,15 +44,21 @@
  *    list without a lock, so it is left in place ("deferred reclamation"):
  *    at most one allocation per interrupted wait lingers until the next
  *    signal_event() or the event's destruction. This is also why nodes are
- *    heap-allocated (kmem_cache) rather than living on the waiter's stack
- *    as the locked iteration had: an interrupted waiter must be able to
- *    leave while its node is still reachable.
+ *    heap-allocated (a cache-aligned slab) rather than living on the
+ *    waiter's stack: an interrupted waiter must be able to leave while its
+ *    node is still reachable.
  *
- *  - Each node pins its task with get_task_struct(), and the signaler takes
- *    a temporary reference of its own before publishing EV_SIGNALED, so
- *    wake_up_process() can never touch a task that already exited -- even
- *    if the woken waiter returns, closes the fd, and dies in the window
- *    between the state change and the wake.
+ *  - The wake itself is made safe by RCU, not refcounting (this iteration's
+ *    main change -- the previous one paid a get/put_task_struct pair per
+ *    node, which dominated large fan-outs). A node still EV_WAITING at the
+ *    xchg() means its waiter was inside wait_for_event() at that instant:
+ *    it cannot return (and so cannot exit) before observing EV_SIGNALED,
+ *    which only we publish. Its release_task() -- after which the
+ *    task_struct is freed one RCU grace period later -- therefore happens
+ *    after the xchg(), i.e. inside our read-side section, so the grace
+ *    period cannot complete until we leave it: wake_up_process() never
+ *    touches freed memory. (This is the same argument the kernel's rcuwait
+ *    relies on.)
  *
  * See ../README.md for the full walk-through of the wait/signal logic.
  */
@@ -62,9 +68,9 @@
 #include <linux/kernel.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
-#include <linux/sched/task.h>
 #include <linux/slab.h>
 
 #include "event_uapi.h"
@@ -77,11 +83,11 @@ enum subscriber_state {
 };
 
 /*
- * One entry per subscriber. Allocated from a slab cache per wait (a wait is
- * a sleep, so one allocation is noise next to the context switch), because
- * an interrupted waiter abandons its node in place -- a stack node could not
- * outlive its owner. ->task holds a reference, dropped by whoever frees the
- * node, so ->task can be dereferenced for as long as the node exists.
+ * One entry per subscriber, allocated per wait from a cache-aligned slab
+ * (one allocation is noise next to the context switch a wait implies, and
+ * the alignment keeps two waiters' nodes from false-sharing a cacheline).
+ * ->task is NOT reference-counted: it is only ever dereferenced under RCU
+ * by a signaler that proved the waiter still parked -- see above.
  */
 struct subscriber {
 	struct subscriber *next;
@@ -94,12 +100,6 @@ struct event {
 };
 
 static struct kmem_cache *subscriber_cache;
-
-static void subscriber_free(struct subscriber *sub)
-{
-	put_task_struct(sub->task);
-	kmem_cache_free(subscriber_cache, sub);
-}
 
 /* create_event(): each open() hands out a brand-new event object. */
 static int event_open(struct inode *inode, struct file *file)
@@ -133,7 +133,7 @@ static int event_release(struct inode *inode, struct file *file)
 	while (sub) {
 		next = sub->next;
 		WARN_ON_ONCE(READ_ONCE(sub->state) == EV_WAITING);
-		subscriber_free(sub);
+		kmem_cache_free(subscriber_cache, sub);
 		sub = next;
 	}
 	kfree(evt);
@@ -158,7 +158,7 @@ static int wait_for_event(struct event *evt)
 	sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
 	if (!sub)
 		return -ENOMEM;
-	sub->task = get_task_struct(current);
+	sub->task = current;
 	sub->state = EV_WAITING;
 
 	/*
@@ -199,7 +199,7 @@ static int wait_for_event(struct event *evt)
 
 	/* EV_SIGNALED: the signaler is done with the node; we own it. */
 	if (sub)
-		subscriber_free(sub);
+		kmem_cache_free(subscriber_cache, sub);
 
 	return ret;
 }
@@ -214,23 +214,33 @@ static int wait_for_event(struct event *evt)
  *
  * Per node, ->next and ->task are read *before* publishing EV_SIGNALED,
  * because the instant the waiter can observe that state it may free the
- * node. The temporary task reference covers the wake itself: the node's own
- * reference dies with the node, which a woken waiter may free before
- * wake_up_process() has run. Taking it before the xchg is safe -- in either
- * reachable state (EV_WAITING, or EV_CANCELLED whose freer is this very
- * walk) the node, and thus its task reference, is still alive.
+ * node. One RCU read-side section spanning the walk is what makes the wakes
+ * themselves safe without any refcounting -- see the lifetime notes at the
+ * top of the file. ->task is only dereferenced when the xchg() proved the
+ * waiter was still parked; a cancelled node's stale pointer is never used.
  */
 static int signal_event(struct event *evt)
 {
 	struct subscriber *sub, *next;
 	int woken = 0;
 
+	/*
+	 * Common fast path: nobody is waiting. A plain read keeps the
+	 * cacheline shared between concurrent signalers (an xchg would
+	 * dirty it even when there is nothing to take). Returning 0 against
+	 * a concurrently-racing registration is linearizable: that waiter
+	 * simply registered "after" this signal.
+	 */
+	if (!READ_ONCE(evt->head))
+		return 0;
+
 	sub = xchg(&evt->head, NULL);
+
+	rcu_read_lock();
 	while (sub) {
 		struct task_struct *task = sub->task;
 
 		next = sub->next;
-		get_task_struct(task);
 
 		if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
 			wake_up_process(task);
@@ -238,12 +248,12 @@ static int signal_event(struct event *evt)
 			/* the waiter frees sub; it is dead to us */
 		} else {
 			/* EV_CANCELLED: abandoned by an interrupted waiter */
-			subscriber_free(sub);
+			kmem_cache_free(subscriber_cache, sub);
 		}
 
-		put_task_struct(task);
 		sub = next;
 	}
+	rcu_read_unlock();
 
 	return woken;
 }
@@ -282,8 +292,8 @@ static int __init event_init(void)
 	int ret;
 
 	subscriber_cache = kmem_cache_create("event_subscriber",
-					     sizeof(struct subscriber), 0, 0,
-					     NULL);
+					     sizeof(struct subscriber), 0,
+					     SLAB_HWCACHE_ALIGN, NULL);
 	if (!subscriber_cache)
 		return -ENOMEM;
 
@@ -294,7 +304,7 @@ static int __init event_init(void)
 		return ret;
 	}
 
-	pr_info("event: loaded (lock-free), device at /dev/event\n");
+	pr_info("event: loaded (lock-free v3), device at /dev/event\n");
 	return 0;
 }
 
@@ -311,4 +321,4 @@ module_exit(event_exit);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
 MODULE_DESCRIPTION("Minimal event synchronization object (/dev/event), lock-free");
-MODULE_VERSION("2.0");
+MODULE_VERSION("3.0");
