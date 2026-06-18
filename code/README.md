@@ -185,10 +185,18 @@ wait and the mixing with other fds are just `epoll`, which already does both
 well. The kernel object is exactly the missing piece (pollable broadcast) and
 nothing more.
 
-## Build & run
+## Requirements
 
-You need the kernel headers for your running kernel
-(`sudo apt install linux-headers-$(uname -r)`).
+- A Linux kernel with headers installed for the running kernel
+  (`sudo apt install linux-headers-$(uname -r)` on Debian/Ubuntu). Developed and
+  tested on **6.17**; it uses only long-stable APIs (`anon_inode_getfd`,
+  `wait_queue_head_t`, `noop_llseek`), so recent kernels in that range should
+  work, but 6.17 is the version actually exercised here.
+- A C toolchain (`gcc`/`clang`, `make`) for the module and the userspace
+  programs. The userspace side is plain POSIX plus `epoll`, so it builds with no
+  extra libraries.
+
+## Build & run
 
 ```bash
 cd module
