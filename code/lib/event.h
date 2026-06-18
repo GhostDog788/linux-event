@@ -69,7 +69,17 @@ static inline int close_event(int evt)
 	return close(evt);
 }
 
-/* ---- listener ---- */
+/* ---- listener ----
+ *
+ * Return conventions across the consume/wait helpers (each is detailed at its
+ * definition; collected here because they differ):
+ *
+ *   event_read       1 alive (*count set, 0 = nothing) / 0 dead / -1 errno
+ *   event_wait       count (>= 1) / 0 timeout / -1 errno (ESHUTDOWN = closed)
+ *   event_wait_first count written (k on success, fewer on timeout) / -1 errno
+ *   event_wait_any   the ready fd (>= 0) / -1 errno (ETIMEDOUT = timeout)
+ *   event_wait_all   n / fewer on timeout / -1 errno
+ */
 
 /* Create a subscription onto evt; returns a pollable fd, or -1 with errno. */
 static inline int subscribe_event(int evt)
