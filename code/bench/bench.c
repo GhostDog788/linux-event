@@ -1,29 +1,27 @@
 // SPDX-License-Identifier: MIT
 /*
- * bench.c - performance harness for the event object (/dev/event).
+ * bench.c - performance harness for the event API (../lib/event.h).
  *
- * The point of this program is *comparability*: event.ko will go through many
- * implementation iterations, and we want a definitive answer to "is the new
- * one better, and in which regime?". So the harness
+ * On this branch an event is just an eventfd, so the "event" implementation
+ * below exercises the library (eventfd under the hood). It is measured against
+ * a per-waiter *futex* control, kernel-native code doing the same single
+ * consumer job, which anchors what the hardware + scheduler can do and catches
+ * a noisy machine: between two runs the control should not move. The harness
  *
  *   - measures the handful of numbers that distinguish implementations (see
  *     the scenario list below),
  *   - sweeps the waiter count, because "better" usually depends on it,
- *   - runs every scenario against controls: the kernel's own *eventfd* (the
- *     same shape as our object, an ioctl signal aside) and a per-waiter
- *     *futex*. The control numbers anchor what the hardware + scheduler can do
- *     and catch a noisy machine: between two runs they should not move.
  *   - dumps every raw sample to CSV (-c) so compare.py can attach percentiles
  *     and a significance test to the A/B verdict.
  *
- * The object is single-consumer (eventfd-shaped), so the model is one waitable
- * object per waiter; the publisher signals each. Scenarios (-s, default all):
+ * The object is single-consumer (eventfd), so the model is one waitable object
+ * per waiter; the publisher signals each. Scenarios (-s, default all):
  *
  *   wake     N waiters each block on their own object; the publisher signals
  *            all N, -r rounds. Metrics: wake_ns (per waiter: signal to that
  *            waiter running), last_wake_ns (until the slowest is running),
  *            signal_call_ns (publisher time to signal all N: the per-waiter
- *            fan-out cost, one broadcast for futex... no, per-waiter here too).
+ *            fan-out cost).
  *
  *   churn    N waiters re-arm in a tight loop while the publisher signals all
  *            their objects flat out for -d seconds. Metrics: wakes_per_sec
@@ -46,12 +44,11 @@
  * and waits for all to report woken under a stuck-timeout.
  *
  * Build:  make            (header-only API from ../lib, plus -pthread)
- * Run:    ./bench [-i event,eventfd,futex] [-s wake,churn,loop,signal0,open]
+ * Run:    ./bench [-i event,futex] [-s wake,churn,loop,signal0,open]
  *                 [-N 1,2,4,16,64,256] [-r rounds] [-d secs] [-R reps]
  *                 [-P period_us] [-W work_us] [-c out.csv] [-l label] [-p cpu]
  *
- * The event scenarios need /dev/event (event.ko loaded); -i eventfd,futex run
- * anywhere, handy for testing the harness.
+ * Everything here is plain eventfd/futex, so it runs anywhere; nothing to load.
  */
 
 #define _GNU_SOURCE
@@ -68,7 +65,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <time.h>
@@ -249,14 +245,14 @@ struct impl {
 	void (*signal)(struct obj *o);
 };
 
-/* event: the object under test, blocked on with a plain read() (poll/epoll
- * work too; read is the most direct wake-latency measure). */
+/* event: the library API (an eventfd), blocked on with a plain read()
+ * (poll/epoll work too; read is the most direct wake-latency measure). */
 
 static void event_create(struct obj *o)
 {
 	o->fd = create_event();
 	if (o->fd < 0)
-		die("create_event: %s (is event.ko loaded?)", strerror(errno));
+		die("create_event: %s", strerror(errno));
 }
 
 static void fd_destroy(struct obj *o)
@@ -276,23 +272,6 @@ static void event_signal(struct obj *o)
 {
 	if (signal_event(o->fd) < 0)
 		die("signal_event: %s", strerror(errno));
-}
-
-/* eventfd: the same-shape control (counter + read drains; write adds). */
-
-static void eventfd_create(struct obj *o)
-{
-	o->fd = eventfd(0, 0);
-	if (o->fd < 0)
-		die("eventfd: %s", strerror(errno));
-}
-
-static void eventfd_signal(struct obj *o)
-{
-	uint64_t one = 1;
-
-	if (write(o->fd, &one, sizeof(one)) != (ssize_t)sizeof(one))
-		die("eventfd write: %s", strerror(errno));
 }
 
 /* futex: a per-waiter 32-bit generation. wait FUTEX_WAITs while the word still
@@ -343,14 +322,6 @@ static const struct impl impls[] = {
 		.destroy = fd_destroy,
 		.wait = fd_wait_read,
 		.signal = event_signal,
-	},
-	{
-		.name = "eventfd",
-		.has_open = true,
-		.create = eventfd_create,
-		.destroy = fd_destroy,
-		.wait = fd_wait_read,
-		.signal = eventfd_signal,
 	},
 	{
 		.name = "futex",
@@ -894,7 +865,7 @@ static void usage(const char *argv0)
 {
 	fprintf(stderr,
 		"usage: %s [options]\n"
-		"  -i list   implementations: event,eventfd,futex (default all)\n"
+		"  -i list   implementations: event,futex (default all)\n"
 		"  -s list   scenarios: wake,churn,loop,signal0,open (default all)\n"
 		"  -N list   waiter counts to sweep (default 1,2,4,16,64,256)\n"
 		"  -r n      wake rounds per waiter count (default 100)\n"
@@ -912,7 +883,7 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-	const char *impl_list = "event,eventfd,futex";
+	const char *impl_list = "event,futex";
 	const char *scen_list = "wake,churn,loop,signal0,open";
 	const char *csv_path = NULL;
 	int counts[64] = { 1, 2, 4, 16, 64, 256 };

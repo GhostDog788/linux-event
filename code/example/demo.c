@@ -10,11 +10,11 @@
  *   4. blocks in epoll_wait and reports each event as it becomes ready,
  *      reading the signal count off the fd.
  *
- * This is the point of the object: it is a first-class pollable fd, so the
- * kernel's own epoll/poll/select do the waiting. No custom wait mechanism.
+ * Each event is an eventfd (see ../lib/event.h), so the kernel's own
+ * epoll/poll/select do the waiting. No custom kernel object, nothing to load.
  *
  * Build:  make           (see Makefile, pulls in ../lib/event.h)
- * Run:    ./demo [num_events]      (default 5; requires event.ko loaded)
+ * Run:    ./demo [num_events]      (default 5)
  */
 
 #include <errno.h>
@@ -72,9 +72,7 @@ int main(int argc, char **argv)
 
 		evts[i] = create_event();
 		if (evts[i] < 0) {
-			fprintf(stderr,
-				"create_event failed: %s\n"
-				"(is event.ko loaded? `sudo insmod ../module/event.ko`)\n",
+			fprintf(stderr, "create_event failed: %s\n",
 				strerror(errno));
 			return 1;
 		}

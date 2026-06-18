@@ -1,5 +1,5 @@
-# Functional tests for event.ko. Build here, copy to the target (where
-# /dev/event lives), run, then check dmesg for WARNs. See ../../HANDOFF.md.
+# Functional tests for the eventfd-backed event API (../lib/event.h).
+# No module to load; just build and run.
 
 CC      ?= cc
 LIBDIR  := ../lib
