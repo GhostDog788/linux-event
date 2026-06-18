@@ -2,16 +2,12 @@
 /*
  * event.ko - the /dev/event pollable broadcast event.
  *
- * Each open("/dev/event") is a broadcast source: a generation counter and a
- * list of subscriptions. A listener calls the SUBSCRIBE ioctl to get its own
- * pollable subscription fd (an anon_inode) with its own consumed generation.
- * signal_event() (an ioctl) raises the generation once and wakes every
- * subscription, so one call broadcasts to all of them without the publisher
- * knowing how many there are. A subscription is poll-to-wait, read-to-consume:
- * you wait on it with poll/epoll/select, and read() never blocks, returning the
- * number of signals since the last read (possibly 0) and advancing the cursor.
- * Per subscription, so each listener sees every signal. The design lives in
- * ../README.md.
+ * open("/dev/event") is a broadcast source: a generation counter plus a list
+ * of subscriptions. The SUBSCRIBE ioctl returns a pollable anon_inode fd with
+ * its own consumed generation; SIGNAL raises the generation and wakes every
+ * subscription, so one call reaches all listeners without the publisher
+ * counting them. A subscription is poll-to-wait, read-to-consume. Design and
+ * safety argument: ../README.md.
  */
 
 #include <linux/anon_inodes.h>
@@ -87,7 +83,6 @@ static int event_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-/* Raise the generation once and wake every subscription; returns how many. */
 static int signal_event(struct event *evt)
 {
 	struct subscription *sub;
@@ -110,11 +105,9 @@ static int signal_event(struct event *evt)
 static const struct file_operations subscription_fops;
 
 /*
- * Consume, never block: this object is poll-to-wait, read-to-consume. Returns
- * the number of signals since the last read (possibly 0) as a u64, advancing
- * the cursor. A 0-byte return is reserved for hangup (the event was closed and
- * nothing is pending), so 8-bytes-with-value-0 ("nothing fired") stays
- * distinct from EOF.
+ * Consume, never block: return the signals since the last read as a u64
+ * (possibly 0), advancing the cursor. A 0-byte return is hangup (event closed,
+ * nothing pending), distinct from an 8-byte read of value 0 ("nothing fired").
  */
 static ssize_t subscription_read(struct file *file, char __user *buf,
 				 size_t count, loff_t *ppos)

@@ -1,12 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * event_uapi.h - ioctl ABI shared between event.ko and userspace.
- * ../lib/event.h redefines these to stay standalone; keep the two in sync.
- *
- * An event (/dev/event) is a broadcast source. SUBSCRIBE returns a pollable
- * subscription fd; SIGNAL raises the generation and wakes every subscription.
- * A subscription is read/poll only: read() returns the number of signals since
- * the last read (a u64) and clears readiness.
+ * event_uapi.h - the /dev/event ioctl ABI. ../lib/event.h redefines these to
+ * stay standalone; keep the two in sync (code/test/abi-check enforces it).
  */
 #ifndef EVENT_UAPI_H
 #define EVENT_UAPI_H
