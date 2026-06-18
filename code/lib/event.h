@@ -142,7 +142,9 @@ static inline int event_wait(int sub, int timeout_ms)
  * ready[] (capacity >= k) in the order observed, and returns how many it wrote:
  * k on success, fewer on timeout, or -1 with errno (EINVAL for a bad n or k).
  * It stops at k, so any extra subscriptions ready in the same poll pass stay
- * readable and surface on the next call (no signal is lost).
+ * readable and surface on the next call (no signal is lost). It reports *which*
+ * fds fired, not how many times each did: the per-event counts are consumed and
+ * dropped, so call event_read yourself if you need them.
  *
  * If a signal interrupts the underlying poll, the count collected so far is
  * returned (already-drained signals are never thrown away); only when nothing
