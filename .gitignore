@@ -39,4 +39,4 @@ todo.md
 # Python bytecode (compare.py).
 __pycache__/
 code/test/selftest
-code/test/cancel-storm
+code/test/broadcast-storm
