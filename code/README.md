@@ -1,32 +1,40 @@
-# `event`: non-busy blocking on an event
+# `event`: a pollable event object
 
-A small Linux kernel object that lets one or more threads **block until an
-event fires**, with *zero* polling latency and *zero* wasted CPU cycles.
+A small Linux kernel object for **blocking until an event fires**, with *zero*
+polling latency and *zero* wasted CPU. It is a first-class pollable file: you
+wait on it with `poll`, `epoll`, or `select`, or you `read()` it. A publisher
+signals it with an ioctl, which raises a generation counter and wakes any
+waiters.
 
 ## The problem
 
 You have a condition (classically: "a global boolean became true") and you want
-a thread to wait for it. Polling (check, sleep, check again) trades latency
-for CPU: the shorter your sleep, the more responsive the wait but the more
-cycles you burn. The `event` object removes the trade-off entirely. A waiter
-sleeps in the kernel and is woken the instant the event is signaled.
+a thread to wait for it. Polling (check, sleep, check again) trades latency for
+CPU: the shorter your sleep, the more responsive the wait but the more cycles
+you burn. The event object removes the trade-off: a waiter sleeps in the kernel
+and is woken the instant the event is signaled. And because it is an ordinary
+waitable fd, it composes with everything the kernel already has for waiting on
+many fds at once.
 
 ## The model
 
-- An **event** is a kernel object that holds a list of **subscribers**
-  (threads currently blocked on it).
-- A **subscriber** registers the calling thread and parks it
-  (`TASK_INTERRUPTIBLE`), so it consumes no CPU while waiting.
-- A **publisher** signals the event, which walks the subscriber list and sets
-  every parked thread back to `TASK_RUNNING`, waking them all at once.
+- An **event** is a kernel object holding a 64-bit **generation** (0 at
+  creation) and a wait queue. `signal_event()` raises the generation and wakes
+  everyone waiting.
+- An event is **readable** while it has been signaled since you last read it.
+  `read()` returns the number of signals since the last read (as a `u64`) and
+  marks them consumed, which clears readiness. So a burst of signals coalesces
+  into one read whose value is the burst size, and a signal that fired while you
+  were away is still seen on your next read: no signal is lost.
+- You wait however you like, because it is a real fd: `poll`/`epoll`/`select`
+  for readiness, then `read()` to consume, or a blocking `read()` directly.
+  Readiness is **level-triggered** by default (ready until you drain it) and
+  works **edge-triggered** under `EPOLLET` (one report per signal).
 
-Signals are **counted**: every `signal_event()` bumps the event's generation,
-and a wait carries the generation its caller last observed. An up-to-date
-waiter parks until the next signal; a waiter that was busy when a signal
-fired returns immediately on its next wait. So a wait/work/re-arm loop
-observes every signal, no matter how late it re-arms. A burst during one
-stretch of work coalesces into a single return with the generation jumped by
-the burst size.
+This is exactly `eventfd`'s behavior with an ioctl signal in place of `write()`:
+the readable count is `gen - seen`. An event is single-consumer per open file
+description (the first reader drains it); `fork`/`dup` share one event and its
+readiness, while independent listeners each create their own event.
 
 ## Layout
 
@@ -37,12 +45,12 @@ code/
 │   ├── event_uapi.h     the ioctl ABI (shared, in spirit, with the lib)
 │   └── Makefile         out-of-tree kbuild
 ├── lib/             header-only userspace API
-│   └── event.h          static-inline wrappers over ioctl on /dev/event
-├── example/         a runnable demo: many listeners, one sender
-│   ├── demo.c           forks N listeners that all block on one event
+│   └── event.h          static-inline wrappers over /dev/event
+├── example/         a runnable demo: many events, one epoll
+│   ├── demo.c           watches N events with epoll, signals every other
 │   └── Makefile
 ├── bench/           the performance yardstick for implementation iterations
-│   ├── bench.c          wake-latency / fan-out / throughput harness (+ futex control)
+│   ├── bench.c          wake-latency / throughput harness (+ eventfd, futex controls)
 │   ├── compare.py       statistical A/B verdict between two bench runs
 │   └── README.md        methodology + the comparison protocol
 └── README.md        this file
@@ -51,142 +59,114 @@ code/
 ## The API
 
 You compile and load `event.ko`. In your program you `#include "event.h"` (from
-`lib/`) and link nothing: every function is a `static inline` wrapper around an
-`ioctl` on the `/dev/event` device the driver exposes.
+`lib/`) and link nothing. The wait path uses standard syscalls on the fd; only
+the publisher's signal is an ioctl.
 
 | Function | Role | Meaning |
 | --- | --- | --- |
-| `int create_event(void)` | publisher | Allocate a new event object; returns an **fd** to it. |
-| `int wait_for_event(int evt, uint64_t *gen, int64_t timeout_ms)` | subscriber | Block until the event is signaled past `*gen`, immediately if it already has been, or until `timeout_ms` expires. Returns `EVT_SIGNALED` (with `*gen` updated; start it at 0) or `EVT_TIMEOUT`. Pass `EVT_WAIT_FOREVER` to never time out, `EVT_WAIT_ZERO` to poll. |
-| `int signal_event(int evt)` | publisher | Bump the generation and wake every thread currently waiting. Returns the number woken. |
-| `int close_event(int evt)` | publisher | Destroy the event (drop this reference). |
+| `int create_event(void)` | both | Allocate a new event; returns an **fd**. |
+| `int create_event_flags(int flags)` | both | As above, with extra `open` flags (`O_NONBLOCK`, `O_CLOEXEC`). |
+| `int signal_event(int evt)` | publisher | Raise the generation and wake every waiter. Returns 0. |
+| `int event_read(int evt, uint64_t *count)` | waiter | Read the number of signals since the last read into `*count`, clearing readiness. Returns 0, or -1 with errno (`EAGAIN` if `O_NONBLOCK` and none pending). |
+| `int event_wait(int evt, int timeout_ms)` | waiter | Convenience: `poll` up to `timeout_ms` (negative = forever) then drain. Returns the count (>= 1), 0 on timeout, -1 on error. |
+| `int close_event(int evt)` | both | Destroy the event (drop this reference). |
 
-An event *is* an open fd, which makes sharing natural: open the event, then
-`fork()`, and parent and children all reference the **same** kernel object
-(the open file table is inherited across a fork). That is precisely how the
-example wires up many listeners and one sender.
-
-### Inside the kernel
-
-`create_event()` is `open("/dev/event")`; each open allocates a fresh event in
-`file->private_data`. `wait_for_event` and `signal_event` are ioctls on that fd.
-
-The implementation is **lock-free**: the event holds a single `head` pointer
-to a LIFO list of subscriber nodes, and every shared access is one atomic
-operation; there is no spinlock anywhere.
+Because the event is a real fd, the waiter side is just standard syscalls; the
+helpers above are thin conveniences. A single-event waiter:
 
 ```c
-/* do_wait(): return once the event is signaled past w->gen, immediately
- * if it already has been, else register (one cmpxchg) and park. */
-static int do_wait(struct event *evt, struct event_wait *w)
-{
-        struct subscriber *sub;
+int evt = create_event();
+struct pollfd p = { .fd = evt, .events = POLLIN };
+while (poll(&p, 1, -1) == 1) {
+        uint64_t n;
+        event_read(evt, &n);   /* n signals fired; clears readiness  */
+        do_work();             /* signals during the work are caught */
+}                              /* by the next read, never lost       */
+```
 
-        if ((u64)atomic64_read(&evt->gen) != w->gen) {
-                w->gen = atomic64_read(&evt->gen);
-                return 0;                 /* signaled while the caller was away */
-        }
+Waiting on many events at once is just `epoll` (what the demo does):
 
-        sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
-        sub->task  = current;             /* no refcount: RCU protects the wake */
-        sub->state = EV_WAITING;
-
-        do {                              /* Treiber push onto the list head */
-                sub->next = READ_ONCE(evt->head);
-        } while (cmpxchg(&evt->head, sub->next, sub) != sub->next);
-
-        for (;;) {
-                set_current_state(TASK_INTERRUPTIBLE);
-                if (smp_load_acquire(&sub->state) == EV_SIGNALED)
-                        break;            /* the signaler handed us the node */
-                if ((u64)atomic64_read(&evt->gen) != w->gen) {
-                        /* a signal claimed the list before our push; resolve
-                         * the node like a cancellation, report the signal */
-                        if (cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED)
-                            == EV_WAITING)
-                                sub = NULL;           /* abandoned in place */
-                        break;
-                }
-                if (signal_pending(current)) { /* -ERESTARTSYS, same resolve */ }
-                schedule();               /* or schedule_hrtimeout() -> -ETIMEDOUT */
-        }
-        __set_current_state(TASK_RUNNING);
-
-        if (sub)
-                kmem_cache_free(subscriber_cache, sub); /* ours when signaled */
-        w->gen = atomic64_read(&evt->gen);
-        return 0;
+```c
+int ep = epoll_create1(0);
+for (i = 0; i < N; i++) {
+        struct epoll_event ev = { .events = EPOLLIN, .data.fd = evt[i] };
+        epoll_ctl(ep, EPOLL_CTL_ADD, evt[i], &ev);
 }
-
-/* signal_event(): bump the generation, claim the whole list with one xchg,
- * wake every node. */
-static int signal_event(struct event *evt)
-{
-        struct subscriber *sub, *next;
-        int woken = 0;
-
-        atomic64_inc(&evt->gen);                  /* the signal exists before */
-                                                  /* anyone can observe it    */
-        if (!READ_ONCE(evt->head))                /* common case: nobody is   */
-                return 0;                         /* waiting; don't dirty the */
-                                                  /* cacheline with an xchg   */
-        sub = xchg(&evt->head, NULL);             /* take-all */
-
-        rcu_read_lock();                          /* makes the wakes safe     */
-        while (sub) {
-                struct task_struct *task = sub->task;
-
-                next = sub->next;                 /* read BEFORE the handoff  */
-                if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
-                        wake_up_process(task);    /* waiter frees sub         */
-                        woken++;
-                } else {
-                        kmem_cache_free(subscriber_cache, sub); /* abandoned  */
-                }
-                sub = next;
-        }
-        rcu_read_unlock();
-        return woken;
+int k = epoll_wait(ep, out, N, -1);
+for (i = 0; i < k; i++) {
+        uint64_t n;
+        event_read(out[i].data.fd, &n);   /* out[i].data.fd fired */
 }
 ```
 
-Why this is safe without a lock:
+## Inside the kernel
 
-- **Generation ordering.** The counter is bumped before the list is claimed,
-  and every path that could observe the signal passes through a fully-ordered
-  atomic (the claim's `xchg`, the waiter's registration `cmpxchg`, the state
-  handoff), so no waiter can park against a generation that has already
-  moved, and no late waiter can read a pre-signal value after registering.
-- **Take-all claiming.** `signal_event()` detaches the entire list with one
-  `xchg`, after which it owns every claimed node outright, concurrent
-  signalers get disjoint chains, and new waiters push onto the fresh empty
-  list and catch up through the generation. Take-all is also what makes the
-  push-only `cmpxchg` immune to ABA.
-- **Ownership handoff by state.** The single atomic that moves a node out of
-  `EV_WAITING` decides who frees it: a signaler's `xchg → EV_SIGNALED` hands
-  the node to the waiter; a waiter that leaves early, interrupting POSIX
-  signal, timeout, or a generation bump that raced past its registration,
-  wins it back with `cmpxchg → EV_CANCELLED` and abandons it in place (it
-  cannot be unlinked from the middle of the list without a lock) for the
-  next signal or the final `close()` to free.
-- **RCU-protected wakes, no refcounting.** A node still `EV_WAITING` at the
-  signaler's `xchg` proves its waiter was inside `wait_for_event()` at that
-  instant, it cannot return (let alone exit) before observing
-  `EV_SIGNALED`, which only this signaler publishes. The task's
-  `release_task()` therefore happens *inside* the signaler's RCU read
-  section, and a `task_struct` is freed only one RCU grace period after
-  `release_task()`, so `wake_up_process()` can never touch freed memory.
-  (The same argument the kernel's `rcuwait` relies on; earlier iterations
-  paid a `get/put_task_struct` pair per node instead, which dominated large
-  fan-outs.)
+`create_event()` is `open("/dev/event")`; each open allocates a fresh event in
+`file->private_data`. The object is a wait queue plus two counters:
 
-The cost of going lock-free: nodes are slab-allocated per wait rather than
-living on the waiter's stack (an interrupted waiter must be able to leave
-while its node is still linked), and a cancelled wait leaves one node behind
-until the next signal. Whether the trade wins is measured, not argued;
-see [Benchmarking](#benchmarking-an-implementation-iteration) below.
+```c
+struct event {
+        wait_queue_head_t wqh;
+        u64 gen;   /* total signals; under wqh.lock */
+        u64 seen;  /* signals consumed via read(); under wqh.lock */
+};
+```
+
+State changes and the wake happen under `wqh.lock`, the same discipline the
+kernel's own `eventfd` uses.
+
+```c
+/* signal_event(): raise the generation and wake waiters. */
+spin_lock_irq(&evt->wqh.lock);
+evt->gen++;
+wake_up_locked_poll(&evt->wqh, EPOLLIN);   /* all pollers + 1 reader */
+spin_unlock_irq(&evt->wqh.lock);
+
+/* read(): return gen - seen, mark consumed (clears readiness). */
+spin_lock_irq(&evt->wqh.lock);
+if (evt->gen == evt->seen) {
+        if (file->f_flags & O_NONBLOCK) { unlock; return -EAGAIN; }
+        wait_event_interruptible_exclusive_locked_irq(evt->wqh,
+                                                      evt->gen != evt->seen);
+}
+cnt = evt->gen - evt->seen;
+evt->seen = evt->gen;
+spin_unlock_irq(&evt->wqh.lock);
+/* copy_to_user(&cnt, 8) */
+
+/* poll(): register and report readiness. */
+poll_wait(file, &evt->wqh, wait);
+return READ_ONCE(evt->gen) != READ_ONCE(evt->seen) ? EPOLLIN | EPOLLRDNORM : 0;
+```
+
+Why this is correct:
+
+- **No lost wakeup.** The generation is raised and the wake issued under one
+  `wqh.lock`; a blocking reader checks `gen != seen` under the same lock before
+  it sleeps, so a signal cannot slip between the check and the sleep. `poll`
+  reads the counters locklessly as a hint and `read` re-checks under the lock
+  before consuming, so a stale poll only costs a re-poll, never a missed event
+  (the standard `eventfd` pattern).
+- **Single consumer, no double-count.** `seen` advances to `gen` exactly once
+  per read under the lock, so concurrent readers of one fd split the signals
+  rather than each seeing them; nothing is counted twice.
+- **Exclusive blocking readers.** A blocking `read` waits exclusively, so a
+  signal wakes one reader, not a thundering herd, while `poll`/`epoll` waiters
+  (non-exclusive) are all woken.
 
 See `module/event.c` for the full, commented source.
+
+## Relationship to eventfd
+
+This object is, deliberately, `eventfd` reimplemented: a counter you wait on as
+a file, where `read()` drains it. The only behavioral difference is the signal
+path, a named `EVENT_IOC_SIGNAL` ioctl (`signal_event()`) instead of `write()`,
+and that the counter is expressed as a monotonic generation internally
+(`count == gen - seen`). That near-equivalence is the point: it makes the
+kernel's own `eventfd` the perfect benchmark control (same semantics, untouched
+by our module), and it keeps the object a small, readable lab piece for studying
+the wait/wake path. If you want this in production, you almost certainly want
+`eventfd` itself; this exists to be understood and measured.
 
 ## Build & run
 
@@ -197,9 +177,9 @@ You need the kernel headers for your running kernel
 # 1. build and load the module
 cd module
 make
-sudo insmod event.ko          # creates /dev/event (mode 0666, so no root needed to use it)
+sudo insmod event.ko          # creates /dev/event (mode 0666, no root to use)
 
-# 2. build and run the demo (5 listeners by default; pass a count to change)
+# 2. build and run the demo (5 events by default; pass a count to change)
 cd ../example
 make
 ./demo 5
@@ -208,24 +188,21 @@ make
 sudo rmmod event
 ```
 
-Expected output (order of the wake-ups varies; they all unblock together):
+Expected output (event ordering may vary):
 
 ```
-[sender | pid 1234] created event (fd 3), spawning 5 listeners
-  [listener 0 | pid 1235] waiting for the event...
-  [listener 1 | pid 1236] waiting for the event...
-  ...
-[sender | pid 1234] signaling the event, waking all listeners
-  [listener 0 | pid 1235] >>> woke up, event received!
-  [listener 2 | pid 1237] >>> woke up, event received!
-  ...
-[sender | pid 1234] done (0 failures)
+[main | pid 1234] created 5 events, watching them with epoll
+[signaler | pid 1235] signaling every other event
+  [main] event 0 ready (2 signals)
+  [main] event 2 ready (1 signal)
+  [main] event 4 ready (1 signal)
+[main | pid 1234] done (0 failures)
 ```
 
-> The demo `sleep(1)`s before signaling only so the "waiting..." lines print
-> before the wake-ups. Signals are counted in the event's generation, so a
-> listener that reaches `wait_for_event()` late returns immediately instead
-> of missing the signal.
+> The signaler `sleep(1)`s before signaling only so the parent reaches
+> `epoll_wait` first. Signals are counted in the generation, so an event
+> signaled before anyone waits is still reported on the next wait, and event 0
+> (signaled twice) coalesces into one ready report of count 2.
 
 ### Debugging the demo in VS Code
 
@@ -241,18 +218,18 @@ The lab can build, upload, and source-debug the demo on the target (where
 The gdbserver port is forwarded over the SSH connection, so it works through a
 NAT'd VM with no extra port-forwarding. Knobs (env vars read by
 `scripts/05-debug-user.sh`): `USERDEBUG_PORT` (port, default 2345), `DEMO_ARGS`
-(listener count, default 3).
+(event count, default 3).
 
-The debugger follows the **sender** (the parent) by default; that's the path
-that calls `signal_event()`. The listeners are forked children; to break inside
-one, run `set follow-fork-mode child` in the Debug Console before continuing.
+The debugger follows the parent by default; that is the path that runs the
+`epoll` loop. The signaler is a forked child; to break inside it, run
+`set follow-fork-mode child` in the Debug Console before continuing.
 
 ## Benchmarking an implementation iteration
 
 The implementation in `module/event.c` is meant to be iterated on. Whether an
 iteration is actually *better*, and in which regime (single waiter, large
-fan-out, high churn), is decided by the benchmark in [`bench/`](bench/), not
-by eyeballing:
+fan-out, high churn), is decided by the benchmark in [`bench/`](bench/), not by
+eyeballing:
 
 ```bash
 scripts/06-bench.sh server          # run on the target, CSV lands in results/
@@ -260,46 +237,21 @@ scripts/06-bench.sh server          # run on the target, CSV lands in results/
 python3 code/bench/compare.py results/<baseline>.csv results/<candidate>.csv
 ```
 
-`compare.py` prints per-metric medians/p99s with a significance test, and a
-built-in futex baseline acts as a control that catches noisy runs. The full
-protocol and what each metric means live in [`bench/README.md`](bench/README.md).
+`compare.py` prints per-metric medians/p99s with a significance test. Each run
+also measures two controls: the kernel's own `eventfd` (the same shape as our
+object, so `event` should track it closely) and a per-waiter `futex`. If a
+control shifts between runs the machine was not quiet and the verdict is void.
+The full protocol lives in [`bench/README.md`](bench/README.md).
 
-## What changed from the original design
+## History
 
-This object began as a paper design (`event - kernel.md`): the right idea, a
-subscriber list with park-then-wake, maintained with **atomic operations
-instead of a lock**, but with racy kernel pseudo-code. This implementation
-keeps the lock-free intent and fixes three real bugs from the original
-sketch:
-
-1. **The registration loop never linked the node.** The original walked the
-   list with `end = atomic_cmpxchg(end, NULL, sub)` and `end = end.next`,
-   which neither appends `sub` nor terminates correctly. Appending at the
-   *tail* is the hard way; pushing at the *head* makes registration a single
-   correct `cmpxchg` (a Treiber push), and a wake-all event doesn't care
-   about list order anyway.
-
-2. **No wakeup-condition loop → lost wakeups and spurious returns.** The
-   original did `set_current_state(...); schedule();` once, with nothing to
-   re-check. A signal landing between "add to list" and `schedule()` would be
-   lost, and any spurious wake would return as if signaled. The fix is the
-   standard pattern: set the task state *before* re-checking the node's
-   state, loop on `schedule()`, and honor `signal_pending()`.
-
-3. **Use-after-free in `signal_event`.** The original `kfree(sub)`'d each
-   subscriber while the waiter still referenced it (and while it could still
-   be mid-wake). Without a lock, "don't free while someone looks" becomes an
-   ownership problem; here a per-node atomic state transition decides exactly
-   who frees each node, and task references make the wake itself safe; see
-   *Inside the kernel* above.
-
-(An earlier iteration of this module fixed the same three bugs with a
-spinlocked `list_head` and stack-resident nodes, `git log module/event.c`
-has it. The benchmark in `bench/` is how the two are judged against each
-other.)
-
-The net effect matches the design's intent: block with no polling, wake all
-subscribers on signal, no lock anywhere, without the races.
+This object began as a custom in-kernel wait mechanism: first a lock-free
+single-event park/wake (`git log` on the `dev` line), then a lock-based
+`event` + `waiter` quorum object that could block on a set of events
+(`feature/epoll-like`). Both built their own way to put a thread to sleep and
+wake it. This version drops the bespoke mechanism entirely: the event is just a
+pollable file, and the kernel's existing `poll`/`epoll`/`select` do the waiting.
+What remains is the smallest useful primitive, an `eventfd` signaled by ioctl.
 
 ## License
 

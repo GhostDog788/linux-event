@@ -1,142 +1,148 @@
 // SPDX-License-Identifier: MIT
 /*
- * demo.c - demonstrate the event object with many listeners and one sender.
+ * demo.c - wait on many events at once with epoll.
  *
  * The program:
- *   1. creates a single event in the parent,
- *   2. clones itself with fork() into N listener children that all
- *      wait_for_event() on the *inherited* fd (same kernel object),
- *   3. acts as the lone sender in the parent: after the listeners have
- *      registered, it signal_event()s once, waking them all at the same time.
+ *   1. creates N events,
+ *   2. adds them all to one epoll instance,
+ *   3. forks a signaler child that, after a beat, signals every other event
+ *      (and one of them twice, to show coalescing),
+ *   4. blocks in epoll_wait and reports each event as it becomes ready,
+ *      reading the signal count off the fd.
  *
- * Everyone prints to the screen so you can watch the listeners block and then
- * wake together.
+ * This is the point of the object: it is a first-class pollable fd, so the
+ * kernel's own epoll/poll/select do the waiting. No custom wait mechanism.
  *
  * Build:  make           (see Makefile, pulls in ../lib/event.h)
- * Run:    ./demo [num_listeners]      (default 5; requires event.ko loaded)
+ * Run:    ./demo [num_events]      (default 5; requires event.ko loaded)
  */
 
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "event.h"
 
-#define DEFAULT_LISTENERS 5
+#define DEFAULT_EVENTS 5
 
-/* Child path: register on the event, block, then report the wake-up. */
-static int run_listener(int evt, int id)
+/* Map an event fd back to its index for tidy printing. */
+static int index_of(const int *evts, int n, int fd)
 {
-	uint64_t gen = 0; /* fresh listener: has seen no signals yet */
+	int i;
 
-	printf("  [listener %d | pid %d] waiting for the event...\n", id,
-	       (int)getpid());
-	fflush(stdout);
-
-	if (wait_for_event(evt, &gen, EVT_WAIT_FOREVER) != EVT_SIGNALED) {
-		fprintf(stderr,
-			"  [listener %d | pid %d] wait_for_event failed: %s\n",
-			id, (int)getpid(), strerror(errno));
-		return 1;
-	}
-
-	printf("  [listener %d | pid %d] >>> woke up, event received!\n", id,
-	       (int)getpid());
-	fflush(stdout);
-	return 0;
+	for (i = 0; i < n; i++)
+		if (evts[i] == fd)
+			return i;
+	return -1;
 }
 
 int main(int argc, char **argv)
 {
-	int listeners = DEFAULT_LISTENERS;
-	int evt, i, failures = 0;
-	pid_t *kids;
+	int n = DEFAULT_EVENTS;
+	int ep, i, expected = 0, seen = 0, failures = 0;
+	int *evts;
+	pid_t kid;
 
 	if (argc > 1) {
-		listeners = atoi(argv[1]);
-		if (listeners < 1) {
-			fprintf(stderr, "num_listeners must be >= 1\n");
+		n = atoi(argv[1]);
+		if (n < 1) {
+			fprintf(stderr, "num_events must be >= 1\n");
 			return 2;
 		}
 	}
 
-	evt = create_event();
-	if (evt < 0) {
-		fprintf(stderr,
-			"create_event failed: %s\n"
-			"(is event.ko loaded? `sudo insmod ../module/event.ko`)\n",
-			strerror(errno));
+	evts = calloc(n, sizeof(*evts));
+	if (!evts) {
+		perror("calloc");
 		return 1;
 	}
-	printf("[sender | pid %d] created event (fd %d), spawning %d listeners\n",
-	       (int)getpid(), evt, listeners);
-	/* Flush before fork() so children don't inherit (and re-emit) our
-	 * still-buffered stdout when output is a pipe rather than a tty. */
+
+	ep = epoll_create1(0);
+	if (ep < 0) {
+		perror("epoll_create1");
+		return 1;
+	}
+
+	for (i = 0; i < n; i++) {
+		struct epoll_event ev = { .events = EPOLLIN };
+
+		evts[i] = create_event();
+		if (evts[i] < 0) {
+			fprintf(stderr,
+				"create_event failed: %s\n"
+				"(is event.ko loaded? `sudo insmod ../module/event.ko`)\n",
+				strerror(errno));
+			return 1;
+		}
+		ev.data.fd = evts[i];
+		if (epoll_ctl(ep, EPOLL_CTL_ADD, evts[i], &ev) < 0) {
+			perror("epoll_ctl");
+			return 1;
+		}
+		if (i % 2 == 0)
+			expected++; /* the child will signal even indices */
+	}
+	printf("[main | pid %d] created %d events, watching them with epoll\n",
+	       (int)getpid(), n);
 	fflush(stdout);
 
-	kids = calloc(listeners, sizeof(*kids));
-	if (!kids) {
-		perror("calloc");
-		close_event(evt);
-		return 1;
+	kid = fork();
+	if (kid == 0) {
+		close(ep);
+		sleep(1); /* let the parent reach epoll_wait first */
+		printf("[signaler | pid %d] signaling every other event\n",
+		       (int)getpid());
+		fflush(stdout);
+		for (i = 0; i < n; i += 2)
+			signal_event(evts[i]);
+		signal_event(evts[0]); /* twice: coalesces into one wake */
+		_exit(0);
 	}
 
-	/* Clone ourselves into N listeners; each inherits the same event fd. */
-	for (i = 0; i < listeners; i++) {
-		pid_t pid = fork();
+	/* Block until every event we expect has reported in. */
+	while (seen < expected) {
+		struct epoll_event out[64];
+		int k = epoll_wait(ep, out, 64, 5000);
 
-		if (pid < 0) {
-			perror("fork");
+		if (k < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("epoll_wait");
 			failures++;
-			kids[i] = -1;
-			continue;
+			break;
 		}
-		if (pid == 0) {
-			int rc = run_listener(evt, i);
-
-			close_event(evt);
-			_exit(rc);
-		}
-		kids[i] = pid;
-	}
-
-	/*
-	 * Give the listeners a moment to print their "waiting..." line so the
-	 * output reads in order. Purely cosmetic: signals are counted in the
-	 * event's generation, so a listener that calls wait_for_event() only
-	 * after we signal still returns immediately instead of missing it.
-	 */
-	sleep(1);
-
-	printf("[sender | pid %d] signaling the event, waking all listeners\n",
-	       (int)getpid());
-	if (signal_event(evt) < 0) {
-		fprintf(stderr, "signal_event failed: %s\n", strerror(errno));
-		failures++;
-	}
-
-	/* Reap the listeners and collect their exit status. */
-	for (i = 0; i < listeners; i++) {
-		int status;
-
-		if (kids[i] < 0)
-			continue;
-		if (waitpid(kids[i], &status, 0) < 0) {
-			perror("waitpid");
+		if (k == 0) {
+			fprintf(stderr, "[main] timed out waiting for events\n");
 			failures++;
-			continue;
+			break;
 		}
-		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-			failures++;
+		for (i = 0; i < k; i++) {
+			int fd = out[i].data.fd;
+			uint64_t count = 0;
+
+			if (event_read(fd, &count) < 0) {
+				perror("event_read");
+				failures++;
+				continue;
+			}
+			printf("  [main] event %d ready (%llu signal%s)\n",
+			       index_of(evts, n, fd), (unsigned long long)count,
+			       count == 1 ? "" : "s");
+			seen++;
+		}
 	}
 
-	close_event(evt);
-	free(kids);
+	waitpid(kid, NULL, 0);
+	for (i = 0; i < n; i++)
+		close_event(evts[i]);
+	close(ep);
+	free(evts);
 
-	printf("[sender | pid %d] done (%d failure%s)\n", (int)getpid(),
-	       failures, failures == 1 ? "" : "s");
+	printf("[main | pid %d] done (%d failure%s)\n", (int)getpid(), failures,
+	       failures == 1 ? "" : "s");
 	return failures ? 1 : 0;
 }
