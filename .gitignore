@@ -40,3 +40,4 @@ todo.md
 __pycache__/
 code/test/selftest
 code/test/broadcast-storm
+code/test/abi-check
