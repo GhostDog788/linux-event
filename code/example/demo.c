@@ -2,13 +2,10 @@
 /*
  * demo.c - broadcast one signal to many listeners, then a k-of-n wait.
  *
- * Phase 1 (broadcast): the parent creates one event and forks N listeners.
- * Each listener SUBSCRIBEs the inherited event (getting its own pollable fd)
- * and blocks. The parent signals once, and *all N* wake. That is the thing a
- * plain eventfd cannot do: one source fanning out to many independent waiters.
- *
+ * Phase 1 (broadcast): the parent creates one event and forks N listeners that
+ * each SUBSCRIBE the inherited event and block; one signal wakes all N.
  * Phase 2 (wait-first): one process subscribes to several events and waits for
- * the first k of them to be ready, then sees which fired, via the kernel's poll.
+ * the first k of them, via the kernel's poll.
  *
  * Build:  make           (see Makefile, pulls in ../lib/event.h)
  * Run:    ./demo [num_listeners]      (default 5; requires event.ko loaded)

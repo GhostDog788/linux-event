@@ -2,48 +2,18 @@
 /*
  * bench.c - performance harness for the broadcast event (/dev/event).
  *
- * The point is comparability: event.ko will go through implementation
- * iterations, and we want a definitive answer to "is the new one better, and in
- * which regime?". The shape is broadcast: one event, N subscriptions, and one
- * signal_event() wakes all of them. So the harness
+ * Shape: one event, N subscriptions, one signal_event() wakes them all. Each
+ * scenario is measured for the event against a futex broadcast control (one
+ * shared counter + FUTEX_WAKE), which anchors the hardware limit and flags a
+ * noisy machine; raw samples go to CSV (-c) for compare.py. Scenarios (-s):
+ * wake (fan-out latency), churn (throughput), loop (the realistic
+ * wait/work/re-arm), signal0 (signal cost, no subscribers), open
+ * (create/destroy). Metrics and methodology live in README.md.
  *
- *   - measures the numbers that distinguish implementations (below),
- *   - sweeps the subscriber count (1 = raw wake latency; hundreds = fan-out),
- *   - runs every scenario against a *futex* control: one shared counter,
- *     FUTEX_WAKE wakes all waiters, the kernel-native way to broadcast, which
- *     anchors what the hardware can do and catches a noisy machine,
- *   - dumps raw samples to CSV (-c) for compare.py.
- *
- * Each waiter owns a subscription to the one shared event and blocks in read();
- * the publisher signals the event once to wake them all. Scenarios (-s):
- *
- *   wake     N subscribers parked; the publisher signals once, -r rounds.
- *            wake_ns (per subscriber: signal to running), last_wake_ns (until
- *            the slowest), signal_call_ns (publisher time inside signal_event).
- *
- *   churn    N subscribers re-arm flat out while the publisher signals flat out
- *            for -d seconds. wakes_per_sec (waiter-side), signal_calls_per_sec,
- *            waiter_wakes (fairness).
- *
- *   loop     N subscribers wait -> work -W us -> re-arm; publisher signals every
- *            -P us for -d seconds. loop_wake_ns, missed_signals (fired while
- *            working, coalesced = sent - caught), signals_sent.
- *
- *   signal0  signal cost with nobody subscribed, batched. signal0_ns.
- *
- *   open     create+destroy of the event, batched. open_close_ns (event only).
- *
- * Validity: a wake round only counts if every subscriber is parked before the
- * signal. The publisher polls /proc/self/task/<tid>/stat until each is in state
- * 'S', then signals and checks signal_event()'s return (subscriptions notified)
- * == N; a short round is discarded into invalid_rounds.
- *
- * Build:  make            (header-only API from ../lib, plus -pthread)
- * Run:    ./bench [-i event,futex] [-s wake,churn,loop,signal0,open]
- *                 [-N 1,2,4,16,64,256] [-r rounds] [-d secs] [-R reps]
- *                 [-P period_us] [-W work_us] [-c out.csv] [-l label] [-p cpu]
- *
- * The event scenarios need /dev/event (event.ko loaded); -i futex runs anywhere.
+ * Run: ./bench [-i event,futex] [-s wake,churn,loop,signal0,open]
+ *              [-N 1,2,4,16,64,256] [-r rounds] [-d secs] [-R reps]
+ *              [-P period_us] [-W work_us] [-c out.csv] [-l label] [-p cpu]
+ * The event scenarios need event.ko loaded; -i futex runs anywhere.
  */
 
 #define _GNU_SOURCE
@@ -208,12 +178,10 @@ static void wait_all_parked(const pid_t *tids, int n, const char *who)
 
 /* --- implementations under test --------------------------------------------
  *
- * Broadcast shape: one shared object, signal_all() wakes everyone. wait() is
- * per-thread. For the event, each thread owns a subscription to the one shared
- * event (created lazily, closed by a TLS destructor so a sweep does not leak
- * fds) and blocks in read(); signal_all() is one signal_event() that wakes all
- * subscriptions. For the futex control, all threads share one counter and
- * signal_all() is one FUTEX_WAKE(INT_MAX).
+ * One shared object; signal_all() wakes everyone, wait() is per-thread. The
+ * event uses a per-thread subscription (created lazily, closed by a TLS
+ * destructor so a sweep does not leak fds); the futex control shares one
+ * counter woken with FUTEX_WAKE(INT_MAX).
  */
 
 struct ctx {
