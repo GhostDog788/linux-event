@@ -72,7 +72,7 @@ signal; the listener uses standard syscalls on its subscription fd.
 | `int signal_event(int evt)` | publisher | Raise the generation and wake every subscription. Returns the number notified. |
 | `int close_event(int evt)` | publisher | Drop the event; live subscriptions get a hangup and finish on their own. |
 | `int subscribe_event(int evt)` | listener | Create a subscription onto `evt`; returns a pollable **fd**. |
-| `int event_read(int sub, uint64_t *count)` | listener | Consume: read the signal count since last read into `*count` and advance the cursor. Never blocks; `*count` is 0 when nothing fired (poll for `EPOLLHUP` to detect a closed event). |
+| `int event_read(int sub, uint64_t *count)` | listener | Consume (never blocks): set `*count` to signals since last read and advance the cursor. Returns `1` alive (`*count` valid, 0 means nothing fired), `0` if the event is dead (closed), `-1` on error. |
 | `int event_wait(int sub, int timeout_ms)` | listener | Convenience: `poll` one subscription then drain. Count (>= 1), 0 on timeout, -1 on error. |
 | `int event_wait_quorum(const int *subs, int n, int k, int timeout_ms, int *ready)` | listener | Wait until at least k of n subscriptions are ready; drains them, fills `ready[]`, returns the count (>= k). |
 | `int close_subscription(int sub)` | listener | Drop a subscription (auto-detaches from its event). |

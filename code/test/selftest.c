@@ -45,11 +45,11 @@ int main(void)
 		return fail("fresh subscription must not be readable");
 	if (signal_event(evt) != 1)
 		return fail("signal should notify the 1 subscription");
-	if (event_read(sub, &count) != 0 || count != 1)
+	if (event_read(sub, &count) != 1 || count != 1)
 		return fail("read should report 1 signal");
 	for (i = 0; i < 5; i++)
 		signal_event(evt);
-	if (event_read(sub, &count) != 0 || count != 5)
+	if (event_read(sub, &count) != 1 || count != 5)
 		return fail("a burst of 5 should coalesce into one read of 5");
 	printf("ok: read reports the count, burst coalesces\n");
 
@@ -59,8 +59,8 @@ int main(void)
 		return fail("second subscribe");
 	if (signal_event(evt) != 2)
 		return fail("signal should notify both subscriptions");
-	if (event_read(sub, &count) != 0 || count != 1 ||
-	    event_read(sub2, &count) != 0 || count != 1)
+	if (event_read(sub, &count) != 1 || count != 1 ||
+	    event_read(sub2, &count) != 1 || count != 1)
 		return fail("both subscriptions must see the one signal");
 	printf("ok: broadcast, both subscriptions see the signal\n");
 
@@ -95,10 +95,10 @@ int main(void)
 	close(ep);
 	printf("ok: epoll level re-reports, edge fires once per signal\n");
 
-	/* 4: read never blocks; an empty subscription reads a count of 0 */
-	if (event_read(sub, &count) != 0 || count != 0)
-		return fail("read of an empty subscription should return count 0");
-	printf("ok: read is non-blocking, empty reads 0\n");
+	/* 4: read never blocks; an empty (alive) subscription reads count 0 */
+	if (event_read(sub, &count) != 1 || count != 0)
+		return fail("read of an empty live subscription should be alive, count 0");
+	printf("ok: read is non-blocking, empty reads alive/0\n");
 
 	/* 5: a poll-driven listener wakes on a cross-process signal */
 	pid = fork();
@@ -112,7 +112,7 @@ int main(void)
 		p.fd = csub;
 		if (poll(&p, 1, 5000) != 1 || !(p.revents & POLLIN))
 			_exit(1);
-		_exit(event_read(csub, &c) == 0 && c >= 1 ? 0 : 1);
+		_exit(event_read(csub, &c) == 1 && c >= 1 ? 0 : 1);
 	}
 	sleep(1);
 	signal_event(evt);
@@ -126,21 +126,23 @@ int main(void)
 		return fail("closed subscription must not be notified");
 	printf("ok: closing a subscription auto-detaches it\n");
 
-	/* 7: closing the event hangs up subscriptions */
+	/* 7: closing the event hangs up subscriptions; read reports dead (0) */
 	{
 		struct pollfd p = { .fd = sub, .events = POLLIN };
+		int r;
 
 		close_event(evt);
 		if (poll(&p, 1, 100) != 1 || !(p.revents & POLLHUP))
 			return fail("closing the event should hang up the subscription");
-		/* drain any pending, then read should report EOF (0) */
-		while (event_read(sub, &count) == 0 && count != 0)
+		/* drain any pending (each read alive == 1), then read reports
+		 * dead == 0, distinct from a live empty read */
+		while ((r = event_read(sub, &count)) == 1 && count != 0)
 			;
-		if (count != 0)
-			return fail("read after hangup should return 0");
+		if (r != 0)
+			return fail("read after hangup should report dead (0)");
 	}
 	close_subscription(sub);
-	printf("ok: closing the event hangs up subscriptions (POLLHUP, EOF)\n");
+	printf("ok: closing the event hangs up subscriptions (POLLHUP, dead)\n");
 
 	/* 8: quorum k=1 and k=n */
 	{

@@ -73,30 +73,31 @@ static inline int subscribe_event(int evt)
 }
 
 /*
- * Consume: read the number of signals since the last read into *count and
- * advance the cursor. This never blocks (the subscription is poll-to-wait,
- * read-to-consume): *count is 0 when nothing has fired. Returns 0 on success,
- * or -1 with errno on error. A 0-count can also mean the event was closed;
- * poll for EPOLLHUP if you need to tell the two apart.
+ * Consume signals on a subscription, never blocking (it is poll-to-wait,
+ * read-to-consume): set *count to the number of signals since the last read and
+ * advance the cursor. The return value tells you which of three things happened:
+ *   1   alive: *count is valid (0 means nothing fired for you, > 0 is the count)
+ *   0   dead:  the event was closed; no more signals will ever come (a hangup)
+ *  -1   error: errno is set
  */
 static inline int event_read(int sub, uint64_t *count)
 {
 	uint64_t c;
 	ssize_t r = read(sub, &c, sizeof(c));
 
-	if (r == 0) {
-		*count = 0;
-		return 0; /* event closed (hangup) */
+	if (r == (ssize_t)sizeof(c)) {
+		*count = c;
+		return 1; /* alive */
 	}
-	if (r != (ssize_t)sizeof(c))
-		return -1;
-	*count = c;
-	return 0;
+	if (r == 0)
+		return 0; /* event closed (hangup) */
+	return -1;	  /* error */
 }
 
 /*
  * Convenience for one subscription: wait up to timeout_ms (negative = forever)
- * then drain. Returns the count read (>= 1), 0 on timeout, -1 with errno. Raw
+ * then drain. Returns the count read (>= 1), 0 on timeout, or -1 with errno on
+ * error, including errno == ESHUTDOWN if the event was closed. Raw
  * poll/epoll/select on the fd remain available.
  */
 static inline int event_wait(int sub, int timeout_ms)
@@ -109,9 +110,15 @@ static inline int event_wait(int sub, int timeout_ms)
 		return -1;
 	if (r == 0)
 		return 0; /* timed out */
-	if (event_read(sub, &count) < 0)
+	switch (event_read(sub, &count)) {
+	case 1:
+		return (int)count;
+	case 0:
+		errno = ESHUTDOWN; /* event closed */
 		return -1;
-	return (int)count;
+	default:
+		return -1;
+	}
 }
 
 /*
@@ -146,9 +153,11 @@ static inline int event_wait_quorum(const int *subs, int n, int k,
 		for (i = 0; i < n; i++) {
 			uint64_t count;
 
-			if (seen[i] || !(p[i].revents & POLLIN))
+			/* POLLHUP (a closed event) counts as ready too, so a
+			 * dead subscription doesn't stall the quorum. */
+			if (seen[i] || !(p[i].revents & (POLLIN | POLLHUP)))
 				continue;
-			if (event_read(subs[i], &count) < 0)
+			if (event_read(subs[i], &count) < 0) /* -1 only on error */
 				return -1;
 			seen[i] = 1;
 			ready[nready++] = subs[i];

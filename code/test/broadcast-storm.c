@@ -40,11 +40,11 @@ static void *reader(void *arg)
 	while (!atomic_load(&stop)) {
 		struct pollfd p = { .fd = sub, .events = POLLIN };
 
-		if (poll(&p, 1, 1) == 1 && event_read(sub, &count) == 0)
+		if (poll(&p, 1, 1) == 1 && event_read(sub, &count) == 1)
 			total += count;
 	}
-	/* drain whatever is left after the last signal */
-	while (event_read(sub, &count) == 0 && count > 0)
+	/* drain whatever is left after the last signal (alive reads == 1) */
+	while (event_read(sub, &count) == 1 && count > 0)
 		total += count;
 
 	per_reader[idx] = (long)total;
