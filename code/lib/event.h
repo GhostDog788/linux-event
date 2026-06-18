@@ -15,12 +15,10 @@
  *     uint64_t n;
  *     event_read(sub, &n);        // n = signals since last read; clears ready
  *
- * The event fd is shared (fork/dup); each listener SUBSCRIBEs to get its own
- * subscription fd, which carries its own consumed generation, so every listener
- * sees every signal (true broadcast) and a burst coalesces into one read. A
- * listener waits on k-of-n events with its own epoll (see event_wait_first /
- * event_wait_any / event_wait_all, which the kernel leaves to userspace). The
- * ABI below must stay in sync with ../module/event_uapi.h.
+ * Each listener SUBSCRIBEs for its own subscription fd and consumed generation,
+ * so all of them see every signal and bursts coalesce. The wait helpers below
+ * do k-of-n in userspace over the subscription fds. Keep the ABI in sync with
+ * ../module/event_uapi.h.
  */
 #ifndef EVENT_H
 #define EVENT_H
@@ -88,12 +86,8 @@ static inline int subscribe_event(int evt)
 }
 
 /*
- * Consume signals on a subscription, never blocking (it is poll-to-wait,
- * read-to-consume): set *count to the number of signals since the last read and
- * advance the cursor. The return value tells you which of three things happened:
- *   1   alive: *count is valid (0 means nothing fired for you, > 0 is the count)
- *   0   dead:  the event was closed; no more signals will ever come (a hangup)
- *  -1   error: errno is set
+ * Consume, never blocks: set *count to the signals since the last read (0 if
+ * none) and advance the cursor. Returns 1 alive / 0 dead / -1 error (table above).
  */
 static inline int event_read(int sub, uint64_t *count)
 {
@@ -110,10 +104,9 @@ static inline int event_read(int sub, uint64_t *count)
 }
 
 /*
- * Convenience for one subscription: wait up to timeout_ms (negative = forever)
- * then drain. Returns the count read (>= 1), 0 on timeout, or -1 with errno on
- * error, including errno == ESHUTDOWN if the event was closed. Raw
- * poll/epoll/select on the fd remain available.
+ * Convenience for one subscription: poll up to timeout_ms (negative = forever)
+ * then drain. Returns count / 0 timeout / -1 errno (ESHUTDOWN = closed); raw
+ * poll/epoll/select on the fd also work.
  */
 static inline int event_wait(int sub, int timeout_ms)
 {
@@ -137,20 +130,14 @@ static inline int event_wait(int sub, int timeout_ms)
 }
 
 /*
- * Wait for the first k of the n subscription fds to become ready
- * (1 <= k <= n <= EVENT_WAIT_MAX). Drains and writes the fds of those k to
- * ready[] (capacity >= k) in the order observed, and returns how many it wrote:
- * k on success, fewer on timeout, or -1 with errno (EINVAL for a bad n or k).
- * It stops at k, so any extra subscriptions ready in the same poll pass stay
- * readable and surface on the next call (no signal is lost). It reports *which*
- * fds fired, not how many times each did: the per-event counts are consumed and
- * dropped, so call event_read yourself if you need them.
- *
- * If a signal interrupts the underlying poll, the count collected so far is
- * returned (already-drained signals are never thrown away); only when nothing
- * has been collected yet does it return -1 with errno == EINTR. Built on
- * poll(); for large n or to mix with non-event fds, run your own epoll with the
- * same accumulate-until-k loop.
+ * Wait for the first k of n subscription fds to become ready
+ * (1 <= k <= n <= EVENT_WAIT_MAX, else EINVAL). Drains those k and writes their
+ * fds to ready[] (capacity >= k); returns the count written (k, or fewer on
+ * timeout). It stops at k, so extras ready in the same pass surface on the next
+ * call (nothing lost), and it reports which fds fired, not the per-fd counts
+ * (those are consumed; use event_read if you need them). A signal-interrupted
+ * poll returns what it has, or -1/EINTR if nothing yet. For large n or to mix
+ * with non-event fds, run your own epoll with this accumulate-until-k loop.
  */
 static inline int event_wait_first(const int *subs, int n, int k,
 				   int timeout_ms, int *ready)
