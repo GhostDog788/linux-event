@@ -1,63 +1,69 @@
 // SPDX-License-Identifier: MIT
 /*
- * event.ko - the /dev/event synchronization object.
+ * event.ko - the /dev/event and /dev/waiter synchronization objects.
  *
- * Each open() creates an independent event. Waiters park (zero CPU) until
- * the event is signaled past the generation they carry; signal_event()
- * bumps the generation and wakes every parked waiter. Lock-free: every
- * shared access is one atomic operation. The design and its safety
- * arguments are documented in ../README.md.
+ * An event (/dev/event) is a generation counter plus a persistent list of
+ * listeners. signal_event() bumps the generation and wakes every listener
+ * without removing it. A waiter (/dev/waiter) holds a set of events; its wait
+ * blocks until at least ->want of them are ready, where an event is ready
+ * while its generation is ahead of the one this waiter last consumed for it.
+ *
+ * A listener is one (waiter, event) registration, linked on both objects'
+ * lists. Each object has a spinlock over its list; the generation is atomic so
+ * readiness is read without the event lock. The design and its locking /
+ * lifetime arguments are documented in ../README.md.
  */
 
 #include <linux/atomic.h>
-#include <linux/hrtimer.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
-#include <linux/rcupdate.h>
 #include <linux/sched.h>
-#include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
+#include <linux/wait.h>
 
 #include "event_uapi.h"
 
-/* The atomic that moves ->state out of EV_WAITING decides who frees the
- * node. */
-enum subscriber_state {
-	EV_WAITING,
-	EV_SIGNALED,  /* signaler wakes the waiter; the waiter frees */
-	EV_CANCELLED, /* waiter left early; the next signal/release frees */
-};
-
-/*
- * Slab-allocated per wait: an early-exiting waiter abandons its node in
- * place (a middle node cannot be unlinked lock-free), so it cannot live on
- * the waiter's stack. ->task is unreferenced; signalers may only
- * dereference it under RCU after proving the waiter still parked.
- */
-struct subscriber {
-	struct subscriber *next;
-	struct task_struct *task;
-	unsigned int state;
-};
-
 struct event {
-	struct subscriber *head; /* lock-free LIFO: cmpxchg push, xchg take-all */
-	atomic64_t gen;		 /* signal count */
+	spinlock_t lock;	    /* protects listeners */
+	struct list_head listeners; /* struct listener.ev_node */
+	atomic64_t gen;		    /* signal count; read without the lock */
 };
 
-static struct kmem_cache *subscriber_cache;
+struct waiter {
+	spinlock_t lock;	    /* protects listeners */
+	struct list_head listeners; /* struct listener.w_node */
+	wait_queue_head_t wq;	    /* signalers wake this */
+};
 
-/* True: the node is now abandoned (EV_CANCELLED) for a later signal or
- * release to free; the caller must not touch it again. False: a signaler
- * got there first; we are signaled and the node is ours. */
-static bool subscriber_cancel(struct subscriber *sub)
+/* One (waiter, event) registration; lives on both lists at once. */
+struct listener {
+	struct list_head ev_node; /* on event->listeners  */
+	struct list_head w_node;  /* on waiter->listeners */
+	struct event *event;
+	struct waiter *waiter;
+	struct file *evt_file;	  /* ref held; keeps the event alive while linked */
+	int evt_fd;		  /* identity reported in the ready set */
+	u64 seen_gen;		  /* generation this listener last consumed */
+};
+
+static struct kmem_cache *listener_cache;
+static const struct file_operations event_fops;
+
+/* True once the event's generation has moved past what this listener saw. */
+static bool listener_ready(struct listener *l)
 {
-	return cmpxchg(&sub->state, EV_WAITING, EV_CANCELLED) == EV_WAITING;
+	return (u64)atomic64_read(&l->event->gen) != l->seen_gen;
 }
+
+/* ---- event object ---- */
 
 static int event_open(struct inode *inode, struct file *file)
 {
@@ -67,145 +73,41 @@ static int event_open(struct inode *inode, struct file *file)
 	if (!evt)
 		return -ENOMEM;
 
+	spin_lock_init(&evt->lock);
+	INIT_LIST_HEAD(&evt->listeners);
+	atomic64_set(&evt->gen, 0);
+
 	file->private_data = evt;
 	return 0;
 }
 
-/* Every wait holds a file reference across its ioctl, so by the time the
- * last close() runs, anything left is an abandoned EV_CANCELLED node. */
+/* Every listener holds an evt_file reference, so the last close() cannot run
+ * while any listener is still linked: the list is necessarily empty here. */
 static int event_release(struct inode *inode, struct file *file)
 {
 	struct event *evt = file->private_data;
-	struct subscriber *sub, *next;
 
-	sub = xchg(&evt->head, NULL);
-	while (sub) {
-		next = sub->next;
-		WARN_ON_ONCE(READ_ONCE(sub->state) == EV_WAITING);
-		kmem_cache_free(subscriber_cache, sub);
-		sub = next;
-	}
+	WARN_ON_ONCE(!list_empty(&evt->listeners));
 	kfree(evt);
 	return 0;
 }
 
-/*
- * Return once the event is signaled past w->gen: immediately if it already
- * has been, else register and park until a signal, an interrupting POSIX
- * signal (-ERESTARTSYS), or the timeout (-ETIMEDOUT). Writes the current
- * generation back on success.
- */
-static int do_wait(struct event *evt, struct event_wait *w)
-{
-	struct subscriber *sub;
-	ktime_t deadline;
-	u64 cur;
-	int ret = 0;
-
-	cur = (u64)atomic64_read(&evt->gen);
-	if (cur != w->gen) {
-		w->gen = cur;
-		return 0;
-	}
-
-	if (w->timeout_ms >= 0)
-		deadline = ktime_add_ms(ktime_get(), w->timeout_ms);
-
-	sub = kmem_cache_alloc(subscriber_cache, GFP_KERNEL);
-	if (!sub)
-		return -ENOMEM;
-	sub->task = current;
-	sub->state = EV_WAITING;
-
-	/* Treiber push; the fully-ordered cmpxchg publishes the fields. */
-	do {
-		sub->next = READ_ONCE(evt->head);
-	} while (cmpxchg(&evt->head, sub->next, sub) != sub->next);
-
-	for (;;) {
-		/* State first, checks second: a signaler either sees us
-		 * parked or we see its update; no lost wakeup. */
-		set_current_state(TASK_INTERRUPTIBLE);
-
-		if (smp_load_acquire(&sub->state) == EV_SIGNALED)
-			break;
-
-		/* A signal claimed the list before our push: it will never
-		 * wake us, but the caller must see it. */
-		if ((u64)atomic64_read(&evt->gen) != w->gen) {
-			if (subscriber_cancel(sub))
-				sub = NULL;
-			break;
-		}
-
-		if (signal_pending(current)) {
-			if (subscriber_cancel(sub)) {
-				ret = -ERESTARTSYS;
-				sub = NULL;
-			}
-			break;
-		}
-
-		if (w->timeout_ms < 0) {
-			schedule();
-		} else if (schedule_hrtimeout(&deadline, HRTIMER_MODE_ABS) ==
-			   0) {
-			/* Deadline passed; a signal racing it wins. */
-			if (smp_load_acquire(&sub->state) == EV_SIGNALED)
-				break;
-			if (subscriber_cancel(sub)) {
-				ret = -ETIMEDOUT;
-				sub = NULL;
-			}
-			break;
-		}
-	}
-	__set_current_state(TASK_RUNNING);
-
-	if (sub) /* EV_SIGNALED: the signaler is done with it; ours to free */
-		kmem_cache_free(subscriber_cache, sub);
-
-	if (ret == 0)
-		w->gen = (u64)atomic64_read(&evt->gen);
-
-	return ret;
-}
-
-/* Bump the generation and wake every parked waiter; returns how many. */
+/* Bump the generation, then wake every listener (leaving it registered);
+ * returns how many were notified. The generation is bumped before the wake,
+ * which carries the barrier, so a woken waiter observes it. */
 static int signal_event(struct event *evt)
 {
-	struct subscriber *sub, *next;
+	struct listener *l;
 	int woken = 0;
 
-	/* Counted before anyone can observe the wake (the ordered RMW
-	 * traffic below propagates it), so late waiters always catch up. */
 	atomic64_inc(&evt->gen);
 
-	/* Nobody waiting: a plain read spares the cacheline an xchg. */
-	if (!READ_ONCE(evt->head))
-		return 0;
-
-	/* Take-all: every claimed node now belongs to this call alone. */
-	sub = xchg(&evt->head, NULL);
-
-	rcu_read_lock(); /* pins each still-parked waiter's task (README) */
-	while (sub) {
-		struct task_struct *task = sub->task;
-
-		/* The waiter may free sub the instant it sees EV_SIGNALED;
-		 * read everything first. */
-		next = sub->next;
-
-		if (xchg(&sub->state, EV_SIGNALED) == EV_WAITING) {
-			wake_up_process(task);
-			woken++;
-		} else {
-			kmem_cache_free(subscriber_cache, sub); /* abandoned */
-		}
-
-		sub = next;
+	spin_lock(&evt->lock);
+	list_for_each_entry(l, &evt->listeners, ev_node) {
+		wake_up_interruptible(&l->waiter->wq);
+		woken++;
 	}
-	rcu_read_unlock();
+	spin_unlock(&evt->lock);
 
 	return woken;
 }
@@ -215,18 +117,6 @@ static long event_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct event *evt = file->private_data;
 
 	switch (cmd) {
-	case EVENT_IOC_WAIT: {
-		struct event_wait __user *uw = (struct event_wait __user *)arg;
-		struct event_wait w;
-		int ret;
-
-		if (copy_from_user(&w, uw, sizeof(w)))
-			return -EFAULT;
-		ret = do_wait(evt, &w);
-		if (!ret && copy_to_user(uw, &w, sizeof(w)))
-			return -EFAULT;
-		return ret;
-	}
 	case EVENT_IOC_SIGNAL:
 		return signal_event(evt);
 	default:
@@ -242,6 +132,254 @@ static const struct file_operations event_fops = {
 	.compat_ioctl = event_ioctl,
 };
 
+/* ---- waiter object ---- */
+
+static int waiter_open(struct inode *inode, struct file *file)
+{
+	struct waiter *w;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return -ENOMEM;
+
+	spin_lock_init(&w->lock);
+	INIT_LIST_HEAD(&w->listeners);
+	init_waitqueue_head(&w->wq);
+
+	file->private_data = w;
+	return 0;
+}
+
+/* Last close(): drain every registration, unlinking each from its event
+ * (event lock) before dropping the held event reference. */
+static int waiter_release(struct inode *inode, struct file *file)
+{
+	struct waiter *w = file->private_data;
+	struct listener *l, *tmp;
+
+	spin_lock(&w->lock);
+	list_for_each_entry_safe(l, tmp, &w->listeners, w_node) {
+		spin_lock(&l->event->lock);
+		list_del(&l->ev_node);
+		spin_unlock(&l->event->lock);
+		list_del(&l->w_node);
+		fput(l->evt_file);
+		kmem_cache_free(listener_cache, l);
+	}
+	spin_unlock(&w->lock);
+
+	kfree(w);
+	return 0;
+}
+
+/* Resolve an event fd to its object, holding the file reference on success. */
+static struct event *event_from_fd(int fd, struct file **filep)
+{
+	struct file *f = fget(fd);
+
+	if (!f)
+		return ERR_PTR(-EBADF);
+	if (f->f_op != &event_fops) {
+		fput(f);
+		return ERR_PTR(-EINVAL);
+	}
+	*filep = f;
+	return f->private_data;
+}
+
+/* Register evt with the waiter. Lock order is waiter then event (see README).
+ * seen_gen is sampled under the event lock at link time, so the listener is
+ * edge-from-now: only signals after this point make it ready. */
+static int waiter_add(struct waiter *w, int evt_fd)
+{
+	struct file *f;
+	struct event *evt;
+	struct listener *l, *new;
+	int ret = 0;
+
+	evt = event_from_fd(evt_fd, &f);
+	if (IS_ERR(evt))
+		return PTR_ERR(evt);
+
+	new = kmem_cache_alloc(listener_cache, GFP_KERNEL);
+	if (!new) {
+		fput(f);
+		return -ENOMEM;
+	}
+	new->event = evt;
+	new->waiter = w;
+	new->evt_file = f;
+	new->evt_fd = evt_fd;
+
+	spin_lock(&w->lock);
+	list_for_each_entry(l, &w->listeners, w_node) {
+		if (l->event == evt) {
+			ret = -EEXIST;
+			goto out;
+		}
+	}
+
+	spin_lock(&evt->lock);
+	new->seen_gen = (u64)atomic64_read(&evt->gen);
+	list_add(&new->ev_node, &evt->listeners);
+	spin_unlock(&evt->lock);
+	list_add(&new->w_node, &w->listeners);
+
+out:
+	spin_unlock(&w->lock);
+	if (ret) {
+		kmem_cache_free(listener_cache, new);
+		fput(f);
+	}
+	return ret;
+}
+
+static int waiter_remove(struct waiter *w, int evt_fd)
+{
+	struct file *f;
+	struct event *evt;
+	struct listener *l, *found = NULL;
+
+	evt = event_from_fd(evt_fd, &f);
+	if (IS_ERR(evt))
+		return PTR_ERR(evt);
+
+	spin_lock(&w->lock);
+	list_for_each_entry(l, &w->listeners, w_node) {
+		if (l->event == evt) {
+			found = l;
+			break;
+		}
+	}
+	if (found) {
+		spin_lock(&evt->lock);
+		list_del(&found->ev_node);
+		spin_unlock(&evt->lock);
+		list_del(&found->w_node);
+	}
+	spin_unlock(&w->lock);
+
+	fput(f); /* the lookup reference */
+	if (!found)
+		return -ENOENT;
+
+	fput(found->evt_file);
+	kmem_cache_free(listener_cache, found);
+	return 0;
+}
+
+/* The wake condition: at least want ready, or fewer events listened on than
+ * requested (which can never reach want, so return at once). */
+static bool waiter_satisfied(struct waiter *w, u32 want)
+{
+	struct listener *l;
+	u32 ready = 0, total = 0;
+
+	spin_lock(&w->lock);
+	list_for_each_entry(l, &w->listeners, w_node) {
+		total++;
+		if (listener_ready(l))
+			ready++;
+	}
+	spin_unlock(&w->lock);
+
+	return ready >= want || total < want;
+}
+
+/* Gather up to want ready fds into buf, consuming each (mark its generation
+ * seen) so it is not reported again until the event fires anew. */
+static int waiter_collect(struct waiter *w, int *buf, u32 want)
+{
+	struct listener *l;
+	int n = 0;
+
+	spin_lock(&w->lock);
+	list_for_each_entry(l, &w->listeners, w_node) {
+		u64 cur;
+
+		if (n == (int)want)
+			break;
+		cur = (u64)atomic64_read(&l->event->gen);
+		if (cur != l->seen_gen) {
+			l->seen_gen = cur;
+			buf[n++] = l->evt_fd;
+		}
+	}
+	spin_unlock(&w->lock);
+
+	return n;
+}
+
+static int waiter_wait(struct waiter *w, struct event_wait *uw)
+{
+	int __user *ready_fds = (int __user *)(uintptr_t)uw->ready_fds;
+	u32 want = uw->want;
+	int *buf;
+	int n, ret = 0;
+
+	if (want == 0 || want > EVENT_WAIT_MAX)
+		return -EINVAL;
+
+	buf = kmalloc_array(want, sizeof(*buf), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (uw->timeout_ms < 0)
+		ret = wait_event_interruptible(w->wq,
+					       waiter_satisfied(w, want));
+	else if (uw->timeout_ms > 0)
+		ret = wait_event_interruptible_hrtimeout(
+			w->wq, waiter_satisfied(w, want),
+			ms_to_ktime(uw->timeout_ms));
+	/* timeout_ms == 0 polls: skip the wait, collect whatever is ready. */
+
+	if (ret == -ERESTARTSYS) /* interrupted; -ETIME just means collect now */
+		goto out;
+
+	n = waiter_collect(w, buf, want);
+	if (copy_to_user(ready_fds, buf, n * sizeof(*buf))) {
+		ret = -EFAULT;
+		goto out;
+	}
+	ret = n;
+
+out:
+	kfree(buf);
+	return ret;
+}
+
+static long waiter_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct waiter *w = file->private_data;
+
+	switch (cmd) {
+	case EVENT_IOC_ADD:
+		return waiter_add(w, (int)arg);
+	case EVENT_IOC_DEL:
+		return waiter_remove(w, (int)arg);
+	case EVENT_IOC_WAIT: {
+		struct event_wait __user *uw = (struct event_wait __user *)arg;
+		struct event_wait wreq;
+
+		if (copy_from_user(&wreq, uw, sizeof(wreq)))
+			return -EFAULT;
+		return waiter_wait(w, &wreq);
+	}
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations waiter_fops = {
+	.owner = THIS_MODULE,
+	.open = waiter_open,
+	.release = waiter_release,
+	.unlocked_ioctl = waiter_ioctl,
+	.compat_ioctl = waiter_ioctl,
+};
+
+/* ---- module ---- */
+
 static struct miscdevice event_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name = "event",
@@ -249,31 +387,50 @@ static struct miscdevice event_misc = {
 	.mode = 0666,
 };
 
+static struct miscdevice waiter_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "waiter",
+	.fops = &waiter_fops,
+	.mode = 0666,
+};
+
 static int __init event_init(void)
 {
 	int ret;
 
-	subscriber_cache = kmem_cache_create("event_subscriber",
-					     sizeof(struct subscriber), 0,
-					     SLAB_HWCACHE_ALIGN, NULL);
-	if (!subscriber_cache)
+	listener_cache = kmem_cache_create("event_listener",
+					   sizeof(struct listener), 0,
+					   SLAB_HWCACHE_ALIGN, NULL);
+	if (!listener_cache)
 		return -ENOMEM;
 
 	ret = misc_register(&event_misc);
 	if (ret) {
-		pr_err("event: misc_register failed: %d\n", ret);
-		kmem_cache_destroy(subscriber_cache);
-		return ret;
+		pr_err("event: misc_register(event) failed: %d\n", ret);
+		goto err_cache;
 	}
 
-	pr_info("event: loaded, device at /dev/event\n");
+	ret = misc_register(&waiter_misc);
+	if (ret) {
+		pr_err("event: misc_register(waiter) failed: %d\n", ret);
+		goto err_event;
+	}
+
+	pr_info("event: loaded, devices at /dev/event and /dev/waiter\n");
 	return 0;
+
+err_event:
+	misc_deregister(&event_misc);
+err_cache:
+	kmem_cache_destroy(listener_cache);
+	return ret;
 }
 
 static void __exit event_exit(void)
 {
+	misc_deregister(&waiter_misc);
 	misc_deregister(&event_misc);
-	kmem_cache_destroy(subscriber_cache);
+	kmem_cache_destroy(listener_cache);
 	pr_info("event: unloaded\n");
 }
 
@@ -282,5 +439,5 @@ module_exit(event_exit);
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
-MODULE_DESCRIPTION("Minimal event synchronization object (/dev/event)");
-MODULE_VERSION("4.1");
+MODULE_DESCRIPTION("Event + waiter synchronization objects (/dev/event, /dev/waiter)");
+MODULE_VERSION("5.0");

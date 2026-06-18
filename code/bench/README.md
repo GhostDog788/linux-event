@@ -54,11 +54,11 @@ Rules that make the result definitive rather than anecdotal:
 | `wake` | `wake_ns` p50/p99 | latency from "publisher calls signal" to "this waiter is running" | latency-sensitive waiters; **n=1 is the purest single-wake number** |
 | `wake` | `last_wake_ns` | time until the *slowest* of n waiters is running (fan-out completion) | broadcast to many subscribers; exposes the cost of the wake-walk and scheduler pile-up at large n |
 | `wake` | `signal_call_ns` | how long the publisher itself is stuck in `signal_event()` | the publisher has other work to do; exposes O(n) walking under the lock |
-| `churn` | `wakes_per_sec` | sustained subscribers-woken throughput with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
-| `churn` | `empty_signal_pct` | how often the publisher found nobody parked | diagnostic: high % = waiters re-arm slower than the publisher signals |
+| `churn` | `wakes_per_sec` | sustained throughput, counted waiter-side from actual wait returns, with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
+| `churn` | `empty_signal_pct` | how often a signal found nobody parked; a control-side metric (meaningful for futex, near zero for the event whose listeners stay registered) | diagnostic for futex: high % = waiters re-arm slower than the publisher signals |
 | `churn` | `waiter_wakes` | per-waiter wake counts | fairness: one starved waiter shows up as a low outlier |
-| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; set `-P`/`-W` to your real workload's numbers |
-| `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced into its next wait's generation jump) | listeners running behind the publisher; an edge-triggered design would silently *lose* these events |
+| `loop` | `loop_wake_ns` p50/p99 | most-recent-signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; set `-P`/`-W` to your real workload's numbers |
+| `loop` | `missed_signals` | signals that fired while a listener was working, coalesced into another return rather than delivered one-for-one (counted as signals-sent minus wait-returns) | listeners running behind the publisher; an edge-triggered design would silently *lose* these events |
 | `signal0` | `signal0_ns` | signal cost with zero subscribers | events that are mostly idle ("publish and nobody listens") |
 | `open` | `open_close_ns` | create + destroy cost | short-lived events created per request |
 
@@ -79,32 +79,31 @@ and silently mix the two. Each round therefore:
 2. polls `/proc/self/task/<tid>/stat` until every waiter thread is in state
    `S`; by that point it is registered, because both event.ko and futex
    enqueue *before* marking the task sleeping,
-3. timestamps, signals once, and **checks the signal's return value
-   (waiters woken) equals n**. A short round is released, discarded, and
-   counted in `invalid_rounds`.
+3. timestamps, signals once, and **checks `signal_all()`'s return equals n**
+   (every listener notified for the event, every waiter woken for futex). A
+   short round is released, discarded, and counted in `invalid_rounds`.
 
 Step 3 is intentionally implementation-agnostic: if a future iteration
 registers waiters in some way that breaks assumption 2, the round is dropped
-loudly instead of polluting the data. It does rely on the uapi contract that
-`EVENT_IOC_SIGNAL` returns the number of waiters woken; keep that contract
-or teach the harness otherwise.
+loudly instead of polluting the data. It relies on `EVENT_IOC_SIGNAL`
+returning a count of all current listeners (all of which are parked once the
+round has gated on step 2); keep that contract or teach the harness otherwise.
 
 Other choices worth knowing:
 
 - Waiters are threads, not forked processes (the demo uses fork). The kernel
-  wake path is identical (`wake_up_process` on a task); threads just make
-  cross-waiter timestamps and round barriers cheap and exact.
+  wake path is identical (waking a task blocked on a wait queue); threads just
+  make cross-waiter timestamps and round barriers cheap and exact.
 - Timestamps are `CLOCK_MONOTONIC`; `wake_ns` includes the signal ioctl's own
   entry cost; that is deliberate: it is the latency the *system* delivers
   from the publisher's decision to the waiter running.
 - The first `max(3, rounds/10)` rounds per combination are warmup and
   discarded.
-- In `churn`, throughput is counted publisher-side from the signal's return
-  value ("parked waiters woken per second"). Per-waiter counts can run
-  higher than that because a waiter that observes the generation move before
-  parking never sleeps; its deliveries don't appear in the signal's return.
-  Compare `wakes_per_sec` across implementations; treat `waiter_wakes` as a
-  fairness signal within one implementation.
+- In `churn`, throughput is counted waiter-side as the sum of actual wait
+  returns over the window (`signal_event()` reports listeners notified, not
+  parked waiters woken, so it cannot stand in for throughput). Compare
+  `wakes_per_sec` across implementations; treat `waiter_wakes` as a fairness
+  signal within one implementation.
 - `-p <cpu>` pins the publisher for steadier `signal_call_ns` numbers; use it
   consistently on both sides of a comparison or not at all.
 

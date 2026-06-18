@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 /*
- * demo.c - demonstrate the event object with many listeners and one sender.
+ * demo.c - demonstrate the event/waiter objects with many listeners and one
+ * sender.
  *
  * The program:
  *   1. creates a single event in the parent,
- *   2. clones itself with fork() into N listener children that all
- *      wait_for_event() on the *inherited* fd (same kernel object),
+ *   2. clones itself with fork() into N listener children; each creates its
+ *      own waiter, adds the *inherited* event fd (same kernel object), and
+ *      blocks in waiter_wait(),
  *   3. acts as the lone sender in the parent: after the listeners have
  *      registered, it signal_event()s once, waking them all at the same time.
  *
@@ -27,25 +29,33 @@
 
 #define DEFAULT_LISTENERS 5
 
-/* Child path: register on the event, block, then report the wake-up. */
+/* Child path: create a waiter, listen on the event, block, report the wake. */
 static int run_listener(int evt, int id)
 {
-	uint64_t gen = 0; /* fresh listener: has seen no signals yet */
+	int w, ready[1];
+
+	w = create_waiter();
+	if (w < 0 || waiter_add(w, evt) < 0) {
+		fprintf(stderr, "  [listener %d | pid %d] setup failed: %s\n",
+			id, (int)getpid(), strerror(errno));
+		return 1;
+	}
 
 	printf("  [listener %d | pid %d] waiting for the event...\n", id,
 	       (int)getpid());
 	fflush(stdout);
 
-	if (wait_for_event(evt, &gen, EVT_WAIT_FOREVER) != EVT_SIGNALED) {
+	if (waiter_wait(w, ready, 1, EVT_WAIT_FOREVER) != 1) {
 		fprintf(stderr,
-			"  [listener %d | pid %d] wait_for_event failed: %s\n",
-			id, (int)getpid(), strerror(errno));
+			"  [listener %d | pid %d] waiter_wait failed: %s\n", id,
+			(int)getpid(), strerror(errno));
 		return 1;
 	}
 
 	printf("  [listener %d | pid %d] >>> woke up, event received!\n", id,
 	       (int)getpid());
 	fflush(stdout);
+	close_waiter(w);
 	return 0;
 }
 
@@ -106,8 +116,8 @@ int main(int argc, char **argv)
 	/*
 	 * Give the listeners a moment to print their "waiting..." line so the
 	 * output reads in order. Purely cosmetic: signals are counted in the
-	 * event's generation, so a listener that calls wait_for_event() only
-	 * after we signal still returns immediately instead of missing it.
+	 * event's generation, so a listener that registers and waits only after
+	 * we signal still returns immediately instead of missing it.
 	 */
 	sleep(1);
 
