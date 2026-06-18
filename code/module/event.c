@@ -268,4 +268,4 @@ module_exit(event_exit);
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("dor");
 MODULE_DESCRIPTION("Pollable broadcast event (/dev/event)");
-MODULE_VERSION("7.0");
+MODULE_VERSION("1.0");
