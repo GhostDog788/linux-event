@@ -36,10 +36,6 @@ gap: a **broadcast source** whose listeners are **pollable fds**.
   least k are ready, finding them in O(ready). The kernel only broadcasts; the
   k-of-n wait lives in userspace where it composes with everything else.
 
-So the division of labor is: the kernel does the one thing nothing else does
-(broadcast to many pollable fds, one cheap signal); `epoll` does the k-of-n wait
-and the mixing it is already good at.
-
 ## Layout
 
 ```
@@ -175,15 +171,12 @@ See `module/event.c` for the full, commented source.
 
 ## Relationship to eventfd and epoll
 
-A subscription behaves like an `eventfd` (a counter you wait on as a file,
-`read` drains it). The event adds the one thing `eventfd` lacks: **broadcast**.
-One `signal_event()` fans out to every subscription in the kernel, in one
-syscall, so the publisher stays O(1) in its own code no matter how many listen
-(contrast: writing N eventfds yourself is O(N) syscalls and makes the publisher
-hold the list). And because subscriptions are ordinary pollable fds, the k-of-n
-wait and the mixing with other fds are just `epoll`, which already does both
-well. The kernel object is exactly the missing piece (pollable broadcast) and
-nothing more.
+A subscription behaves like an `eventfd`: a counter you wait on as a file and
+`read` to drain. The event adds the one thing `eventfd` lacks, **broadcast**:
+one `signal_event()` fans out to every subscription inside the kernel, so the
+publisher stays O(1) no matter how many listen (writing N eventfds yourself is
+O(N) syscalls and forces the publisher to track them). Everything else, the
+poll/epoll wait and the k-of-n, is the kernel's existing machinery.
 
 ## Requirements
 

@@ -19,8 +19,11 @@ python3 compare.py a.csv b.csv         # the verdict
 ./bench -i futex                       # control only: runs with no module loaded
 ```
 
-That is all you need. The `## The protocol` and lab references below are for the
-optional remote-VM harness (`scripts/`); skip them if you build and run locally.
+A full default sweep takes a few minutes (dominated by churn/loop); while
+hacking, `./bench -s wake -N 1,64 -r 50` is a quick check, and `./bench -h`
+lists every knob. That is all you need; the `## The protocol` and lab references
+below are for the optional remote-VM harness (`scripts/`), skip them if you
+build and run locally.
 
 ## The protocol (optional remote-VM lab)
 
@@ -121,17 +124,3 @@ Other choices worth knowing:
   treat `waiter_wakes` as a fairness signal within one implementation.
 - `-p <cpu>` pins the publisher for steadier `signal_call_ns` numbers; use it
   consistently on both sides of a comparison or not at all.
-
-## Running it by hand
-
-```bash
-make                       # builds ./bench (needs only ../lib/event.h + -pthread)
-./bench -h                 # all knobs
-./bench -i futex           # harness self-test: runs anywhere, no module needed
-./bench -c out.csv -l v2   # full sweep, raw samples to out.csv
-```
-
-A full default sweep (6 waiter counts × {wake, churn} × 2 implementations +
-the batched micro-benchmarks) takes roughly 3–4 minutes, dominated by churn
-(`-d` seconds × `-R` reps per cell). For a quick smoke signal while hacking:
-`./bench -s wake -N 1,64 -r 50`.
