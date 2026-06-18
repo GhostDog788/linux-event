@@ -127,13 +127,18 @@ static inline int event_wait(int sub, int timeout_ms)
 }
 
 /*
- * Wait for the first k of the n subscription fds to become ready (1 <= k <= n).
- * Drains and writes the fds of those k to ready[] (capacity >= k) in the order
- * observed, and returns how many it wrote: k on success, fewer on timeout, or
- * -1 with errno. It stops at k, so any extra subscriptions ready in the same
- * poll pass stay readable and surface on the next call (no signal is lost).
- * Built on poll(); for large n or to mix with non-event fds, run your own epoll
- * with the same accumulate-until-k loop.
+ * Wait for the first k of the n subscription fds to become ready
+ * (1 <= k <= n <= EVENT_WAIT_MAX). Drains and writes the fds of those k to
+ * ready[] (capacity >= k) in the order observed, and returns how many it wrote:
+ * k on success, fewer on timeout, or -1 with errno (EINVAL for a bad n or k).
+ * It stops at k, so any extra subscriptions ready in the same poll pass stay
+ * readable and surface on the next call (no signal is lost).
+ *
+ * If a signal interrupts the underlying poll, the count collected so far is
+ * returned (already-drained signals are never thrown away); only when nothing
+ * has been collected yet does it return -1 with errno == EINTR. Built on
+ * poll(); for large n or to mix with non-event fds, run your own epoll with the
+ * same accumulate-until-k loop.
  */
 static inline int event_wait_first(const int *subs, int n, int k,
 				   int timeout_ms, int *ready)
