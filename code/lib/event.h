@@ -42,6 +42,11 @@ extern "C" {
 #define EVENT_IOC_SIGNAL _IO(EVENT_IOC_MAGIC, 2)
 #define EVENT_IOC_SUBSCRIBE _IO(EVENT_IOC_MAGIC, 6)
 
+/* Upper bound on n for event_wait_first / event_wait_any / event_wait_all.
+ * They build per-call arrays on the stack, so n is bounded; for a larger set,
+ * run your own epoll over the subscription fds. */
+#define EVENT_WAIT_MAX 1024
+
 /* ---- publisher / factory ---- */
 
 /* Allocate a new broadcast event; returns an fd, or -1 with errno set. */
@@ -133,12 +138,18 @@ static inline int event_wait(int sub, int timeout_ms)
 static inline int event_wait_first(const int *subs, int n, int k,
 				   int timeout_ms, int *ready)
 {
-	struct pollfd p[n];
-	char seen[n];
 	int nready = 0, i;
 
-	if (k < 1 || k > n)
+	if (k < 1 || k > n || n > EVENT_WAIT_MAX) {
+		errno = EINVAL;
 		return -1;
+	}
+
+	/* n is now validated (1 <= k <= n <= EVENT_WAIT_MAX): safe to size the
+	 * per-call arrays by it. */
+	struct pollfd p[n];
+	char seen[n];
+
 	for (i = 0; i < n; i++) {
 		p[i].fd = subs[i];
 		p[i].events = POLLIN;
@@ -191,6 +202,10 @@ static inline int event_wait_any(const int *subs, int n, int timeout_ms)
  */
 static inline int event_wait_all(const int *subs, int n, int timeout_ms)
 {
+	if (n < 1 || n > EVENT_WAIT_MAX) {
+		errno = EINVAL;
+		return -1;
+	}
 	int ready[n];
 
 	return event_wait_first(subs, n, n, timeout_ms, ready);
