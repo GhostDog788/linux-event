@@ -34,7 +34,7 @@ gap: a **broadcast source** whose listeners are **pollable fds**.
 - **k-of-n is the listener's epoll**, not the kernel's: a listener adds its
   subscription fds (and any other fds) to its own `epoll`, and waits until at
   least k are ready, finding them in O(ready). The kernel only broadcasts; the
-  quorum lives in userspace where it composes with everything else.
+  k-of-n wait lives in userspace where it composes with everything else.
 
 So the division of labor is: the kernel does the one thing nothing else does
 (broadcast to many pollable fds, one cheap signal); `epoll` does the k-of-n wait
@@ -74,7 +74,9 @@ signal; the listener uses standard syscalls on its subscription fd.
 | `int subscribe_event(int evt)` | listener | Create a subscription onto `evt`; returns a pollable **fd**. |
 | `int event_read(int sub, uint64_t *count)` | listener | Consume (never blocks): set `*count` to signals since last read and advance the cursor. Returns `1` alive (`*count` valid, 0 means nothing fired), `0` if the event is dead (closed), `-1` on error. |
 | `int event_wait(int sub, int timeout_ms)` | listener | Convenience: `poll` one subscription then drain. Count (>= 1), 0 on timeout, -1 on error. |
-| `int event_wait_quorum(const int *subs, int n, int k, int timeout_ms, int *ready)` | listener | Wait until at least k of n subscriptions are ready; drains them, fills `ready[]`, returns the count (>= k). |
+| `int event_wait_first(const int *subs, int n, int k, int timeout_ms, int *ready)` | listener | Wait for the first k of n subscriptions to be ready; drains those k, fills `ready[]` (capacity >= k), returns how many it wrote (k on success, fewer on timeout). |
+| `int event_wait_any(const int *subs, int n, int timeout_ms)` | listener | Wait for any one to be ready; returns its fd (>= 0), or -1 with errno (`ETIMEDOUT` on timeout). The k == 1 case. |
+| `int event_wait_all(const int *subs, int n, int timeout_ms)` | listener | Wait for all n to be ready (the k == n case); returns n on success, fewer on timeout. No `ready[]`: on success every one of `subs` fired. |
 | `int close_subscription(int sub)` | listener | Drop a subscription (auto-detaches from its event). |
 
 The event fd is shared (`fork`/`dup`), so a publisher can hand it to listeners;
@@ -96,9 +98,9 @@ epoll_ctl(ep, EPOLL_CTL_ADD, sub, &ev);   /* alongside sockets, timerfd, ... */
 /* accumulate until k of the watched events are ready, then read each */
 ```
 
-`event_wait_quorum` packages the common pure-event case (wait for k of n
-subscriptions); for mixing with non-event fds, run the same
-accumulate-until-k loop on your own epoll.
+`event_wait_first` (with `event_wait_any` for k == 1 and `event_wait_all` for
+k == n) packages the common pure-event case; for mixing with non-event fds, run
+the same accumulate-until-k loop on your own epoll.
 
 ## Inside the kernel
 
@@ -195,7 +197,7 @@ sudo insmod event.ko          # creates /dev/event (mode 0666, no root to use)
 
 cd ../example
 make
-./demo 5                      # 5 listeners, one signal wakes all; then a quorum
+./demo 5                      # 5 listeners, one signal wakes all; then wait-first
 
 sudo rmmod event
 ```
@@ -209,8 +211,8 @@ Expected output (wake order varies; all unblock together):
 [publisher | pid 1234] one signal, waking all listeners
   [listener 3 | pid 1238] >>> woke up, event received!
   ...
-[quorum] subscribing to 3 events, waiting for any 2
-[quorum] 2 ready: event0 event2
+[first] subscribing to 3 events, waiting for the first 2
+[first] 2 ready: event0 event2
 ```
 
 ## Debugging the demo in VS Code

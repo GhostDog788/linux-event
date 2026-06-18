@@ -18,9 +18,9 @@
  * The event fd is shared (fork/dup); each listener SUBSCRIBEs to get its own
  * subscription fd, which carries its own consumed generation, so every listener
  * sees every signal (true broadcast) and a burst coalesces into one read. A
- * listener waits on k-of-n events with its own epoll (see event_wait_quorum,
- * which the kernel leaves to userspace). The ABI below must stay in sync with
- * ../module/event_uapi.h.
+ * listener waits on k-of-n events with its own epoll (see event_wait_first /
+ * event_wait_any / event_wait_all, which the kernel leaves to userspace). The
+ * ABI below must stay in sync with ../module/event_uapi.h.
  */
 #ifndef EVENT_H
 #define EVENT_H
@@ -122,18 +122,20 @@ static inline int event_wait(int sub, int timeout_ms)
 }
 
 /*
- * Wait until at least k of the n subscription fds are ready (k <= n; k == n
- * waits for all). Drains the ready ones, writes their fds to ready[] (capacity
- * >= n) in the order observed, and returns how many are ready (>= k), 0 on
- * timeout, or -1 with errno. Built on poll(); for large n or to mix with
- * non-event fds, run your own epoll with the same accumulate-until-k loop.
+ * Wait for the first k of the n subscription fds to become ready (1 <= k <= n).
+ * Drains and writes the fds of those k to ready[] (capacity >= k) in the order
+ * observed, and returns how many it wrote: k on success, fewer on timeout, or
+ * -1 with errno. It stops at k, so any extra subscriptions ready in the same
+ * poll pass stay readable and surface on the next call (no signal is lost).
+ * Built on poll(); for large n or to mix with non-event fds, run your own epoll
+ * with the same accumulate-until-k loop.
  */
-static inline int event_wait_quorum(const int *subs, int n, int k,
-				    int timeout_ms, int *ready)
+static inline int event_wait_first(const int *subs, int n, int k,
+				   int timeout_ms, int *ready)
 {
 	struct pollfd p[n];
 	char seen[n];
-	int have = 0, nready = 0, i;
+	int nready = 0, i;
 
 	if (k < 1 || k > n)
 		return -1;
@@ -143,28 +145,55 @@ static inline int event_wait_quorum(const int *subs, int n, int k,
 		seen[i] = 0;
 	}
 
-	while (have < k) {
+	while (nready < k) {
 		int r = poll(p, n, timeout_ms);
 
 		if (r < 0)
-			return errno == EINTR ? (have ? nready : -1) : -1;
+			return errno == EINTR && nready ? nready : -1;
 		if (r == 0)
 			return nready; /* timed out: however many we have */
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < n && nready < k; i++) {
 			uint64_t count;
 
 			/* POLLHUP (a closed event) counts as ready too, so a
-			 * dead subscription doesn't stall the quorum. */
+			 * dead subscription does not stall the wait. */
 			if (seen[i] || !(p[i].revents & (POLLIN | POLLHUP)))
 				continue;
 			if (event_read(subs[i], &count) < 0) /* -1 only on error */
 				return -1;
 			seen[i] = 1;
 			ready[nready++] = subs[i];
-			have++;
 		}
 	}
 	return nready;
+}
+
+/*
+ * Wait for any one of the n subscription fds to become ready; consume it and
+ * return its fd (>= 0). On timeout returns -1 with errno == ETIMEDOUT; on other
+ * errors returns -1 with errno set. The k == 1 case of event_wait_first.
+ */
+static inline int event_wait_any(const int *subs, int n, int timeout_ms)
+{
+	int fd, r = event_wait_first(subs, n, 1, timeout_ms, &fd);
+
+	if (r == 1)
+		return fd;
+	if (r == 0)
+		errno = ETIMEDOUT;
+	return -1;
+}
+
+/*
+ * Wait for all n subscription fds to become ready (the k == n case). Returns n
+ * when all are ready, fewer on timeout, or -1 with errno. No ready[] is needed:
+ * on success every one of subs fired.
+ */
+static inline int event_wait_all(const int *subs, int n, int timeout_ms)
+{
+	int ready[n];
+
+	return event_wait_first(subs, n, n, timeout_ms, ready);
 }
 
 /* Destroy a subscription (it auto-detaches from its event). */

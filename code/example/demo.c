@@ -7,8 +7,8 @@
  * and blocks. The parent signals once, and *all N* wake. That is the thing a
  * plain eventfd cannot do: one source fanning out to many independent waiters.
  *
- * Phase 2 (quorum): one process subscribes to several events and waits until
- * k of them are ready, then sees which fired, all via the kernel's own poll.
+ * Phase 2 (wait-first): one process subscribes to several events and waits for
+ * the first k of them to be ready, then sees which fired, via the kernel's poll.
  *
  * Build:  make           (see Makefile, pulls in ../lib/event.h)
  * Run:    ./demo [num_listeners]      (default 5; requires event.ko loaded)
@@ -116,11 +116,11 @@ static int phase_broadcast(int listeners)
 	return failures;
 }
 
-static int phase_quorum(void)
+static int phase_wait_first(void)
 {
 	int evts[3], subs[3], ready[3], i, n;
 
-	printf("[quorum] subscribing to 3 events, waiting for any 2\n");
+	printf("[first] subscribing to 3 events, waiting for the first 2\n");
 	for (i = 0; i < 3; i++) {
 		evts[i] = create_event();
 		subs[i] = evts[i] < 0 ? -1 : subscribe_event(evts[i]);
@@ -133,12 +133,12 @@ static int phase_quorum(void)
 	signal_event(evts[0]);
 	signal_event(evts[2]);
 
-	n = event_wait_quorum(subs, 3, 2, 5000, ready);
+	n = event_wait_first(subs, 3, 2, 5000, ready);
 	if (n < 2) {
-		fprintf(stderr, "[quorum] expected >= 2 ready, got %d\n", n);
+		fprintf(stderr, "[first] expected 2 ready, got %d\n", n);
 		return 1;
 	}
-	printf("[quorum] %d ready:", n);
+	printf("[first] %d ready:", n);
 	for (i = 0; i < n; i++) {
 		int which = ready[i] == subs[0] ? 0 : ready[i] == subs[1] ? 1 : 2;
 
@@ -167,7 +167,7 @@ int main(int argc, char **argv)
 
 	failures += phase_broadcast(listeners);
 	printf("\n");
-	failures += phase_quorum();
+	failures += phase_wait_first();
 
 	printf("\n[done] %d failure%s\n", failures, failures == 1 ? "" : "s");
 	return failures ? 1 : 0;

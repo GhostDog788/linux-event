@@ -6,7 +6,7 @@
  *   5. a blocking read wakes on a signal from another process
  *   6. closing a subscription auto-detaches it (signal counts only the rest)
  *   7. closing the event hangs up subscriptions (EPOLLHUP, read returns 0)
- *   8. event_wait_quorum for k=1 and k=n
+ *   8. event_wait_any / event_wait_first / event_wait_all
  */
 #include <errno.h>
 #include <stdio.h>
@@ -144,7 +144,7 @@ int main(void)
 	close_subscription(sub);
 	printf("ok: closing the event hangs up subscriptions (POLLHUP, dead)\n");
 
-	/* 8: quorum k=1 and k=n */
+	/* 8: event_wait_any, event_wait_first, event_wait_all */
 	{
 		int evts[3], subs[3], ready[3], n;
 
@@ -152,24 +152,33 @@ int main(void)
 			evts[i] = create_event();
 			subs[i] = evts[i] < 0 ? -1 : subscribe_event(evts[i]);
 			if (subs[i] < 0)
-				return fail("quorum setup");
+				return fail("wait setup");
 		}
+		/* any: returns the ready fd */
 		signal_event(evts[1]);
-		n = event_wait_quorum(subs, 3, 1, 1000, ready);
-		if (n != 1 || ready[0] != subs[1])
-			return fail("k=1 quorum should return the one ready");
+		if (event_wait_any(subs, 3, 1000) != subs[1])
+			return fail("wait_any should return the one ready fd");
+		/* any: timeout returns -1/ETIMEDOUT */
+		if (event_wait_any(subs, 3, 100) != -1 || errno != ETIMEDOUT)
+			return fail("wait_any timeout should be -1/ETIMEDOUT");
+		/* first k=2 of 3 */
+		signal_event(evts[0]);
+		signal_event(evts[2]);
+		n = event_wait_first(subs, 3, 2, 1000, ready);
+		if (n != 2)
+			return fail("wait_first(k=2) should return 2");
+		/* all */
 		signal_event(evts[0]);
 		signal_event(evts[1]);
 		signal_event(evts[2]);
-		n = event_wait_quorum(subs, 3, 3, 1000, ready);
-		if (n != 3)
-			return fail("k=n quorum should return all 3");
+		if (event_wait_all(subs, 3, 1000) != 3)
+			return fail("wait_all should return all 3");
 		for (i = 0; i < 3; i++) {
 			close_subscription(subs[i]);
 			close_event(evts[i]);
 		}
 	}
-	printf("ok: quorum k=1 and k=n\n");
+	printf("ok: event_wait_any / event_wait_first / event_wait_all\n");
 
 	printf("all selftests passed\n");
 	return 0;
