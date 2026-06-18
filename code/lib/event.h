@@ -73,10 +73,11 @@ static inline int subscribe_event(int evt)
 }
 
 /*
- * Read the number of signals since the last read into *count (clearing
- * readiness). Returns 0 on success, or -1 with errno set: EAGAIN if the
- * subscription is O_NONBLOCK and nothing is pending, EINTR if interrupted. A
- * read of 0 (count set to 0) means the event was closed (hangup).
+ * Consume: read the number of signals since the last read into *count and
+ * advance the cursor. This never blocks (the subscription is poll-to-wait,
+ * read-to-consume): *count is 0 when nothing has fired. Returns 0 on success,
+ * or -1 with errno on error. A 0-count can also mean the event was closed;
+ * poll for EPOLLHUP if you need to tell the two apart.
  */
 static inline int event_read(int sub, uint64_t *count)
 {
@@ -85,20 +86,12 @@ static inline int event_read(int sub, uint64_t *count)
 
 	if (r == 0) {
 		*count = 0;
-		return 0; /* event closed */
+		return 0; /* event closed (hangup) */
 	}
 	if (r != (ssize_t)sizeof(c))
 		return -1;
 	*count = c;
 	return 0;
-}
-
-/* Make a subscription non-blocking (so event_read returns EAGAIN when empty). */
-static inline int subscription_set_nonblock(int sub)
-{
-	int fl = fcntl(sub, F_GETFL);
-
-	return fl < 0 ? -1 : fcntl(sub, F_SETFL, fl | O_NONBLOCK);
 }
 
 /*

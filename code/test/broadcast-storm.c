@@ -31,7 +31,7 @@ static void *reader(void *arg)
 	uint64_t total = 0, count;
 	int sub = subscribe_event(evt);
 
-	if (sub < 0 || subscription_set_nonblock(sub) < 0)
+	if (sub < 0)
 		exit(2);
 	atomic_fetch_add(&subscribed, 1);
 	while (!atomic_load(&go))

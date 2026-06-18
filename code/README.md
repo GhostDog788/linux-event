@@ -72,7 +72,7 @@ signal; the listener uses standard syscalls on its subscription fd.
 | `int signal_event(int evt)` | publisher | Raise the generation and wake every subscription. Returns the number notified. |
 | `int close_event(int evt)` | publisher | Drop the event; live subscriptions get a hangup and finish on their own. |
 | `int subscribe_event(int evt)` | listener | Create a subscription onto `evt`; returns a pollable **fd**. |
-| `int event_read(int sub, uint64_t *count)` | listener | Read the signal count since last read into `*count`, clearing readiness. A read of 0 means the event was closed. |
+| `int event_read(int sub, uint64_t *count)` | listener | Consume: read the signal count since last read into `*count` and advance the cursor. Never blocks; `*count` is 0 when nothing fired (poll for `EPOLLHUP` to detect a closed event). |
 | `int event_wait(int sub, int timeout_ms)` | listener | Convenience: `poll` one subscription then drain. Count (>= 1), 0 on timeout, -1 on error. |
 | `int event_wait_quorum(const int *subs, int n, int k, int timeout_ms, int *ready)` | listener | Wait until at least k of n subscriptions are ready; drains them, fills `ready[]`, returns the count (>= k). |
 | `int close_subscription(int sub)` | listener | Drop a subscription (auto-detaches from its event). |
@@ -135,24 +135,26 @@ list_for_each_entry(sub, &evt->subs, node)
         wake_up_interruptible_poll(&sub->wqh, EPOLLIN);
 spin_unlock(&evt->lock);
 
-/* subscription read(): return gen - seen, mark consumed. */
+/* subscription read(): consume, never block. return gen - seen (maybe 0). */
 spin_lock_irq(&sub->wqh.lock);
-if (atomic64_read(&evt->gen) == sub->seen) {
-        if (evt->dead) { unlock; return 0; }              /* hangup: EOF */
-        if (O_NONBLOCK) { unlock; return -EAGAIN; }
-        wait_event_interruptible_exclusive_locked_irq(sub->wqh,
-                atomic64_read(&evt->gen) != sub->seen || evt->dead);
+if (atomic64_read(&evt->gen) == sub->seen && evt->dead) {
+        unlock; return 0;                                 /* hangup: EOF */
 }
 cnt = atomic64_read(&evt->gen) - sub->seen; sub->seen += cnt;
 spin_unlock_irq(&sub->wqh.lock);                          /* copy_to_user(cnt) */
 ```
 
-Why this is correct:
+The subscription is **poll-to-wait, read-to-consume**: you wait on it with
+`poll`/`epoll`, and `read` never blocks, it just reports the count since last
+read (possibly 0) and advances the cursor. A 0-byte read is reserved for the
+hangup case (event closed, nothing pending), so it stays distinct from an
+8-byte read of value 0 ("nothing fired"). Why this is correct:
 
 - **No lost wakeup.** The generation is raised before the wake (which carries
-  the barrier); a blocking reader re-checks `gen != seen` under `wqh.lock`
-  before sleeping; `poll` reads `gen`/`seen` locklessly and `read` re-checks
-  under the lock. The standard eventfd discipline, per subscription.
+  the barrier). All the waiting is `poll`/`epoll` on `wqh`, which the kernel's
+  poll machinery handles; `poll` reads `gen`/`seen` locklessly and the
+  subsequent `read` re-checks under `wqh.lock`. Keeping `read` non-blocking
+  leaves the only wakeup reasoning in the poll path.
 - **Broadcast with independent consume.** Each subscription has its own `seen`,
   advanced only by its own reads, so every listener observes every signal and a
   burst coalesces, with no consumer racing another to drain a shared counter.

@@ -95,28 +95,30 @@ int main(void)
 	close(ep);
 	printf("ok: epoll level re-reports, edge fires once per signal\n");
 
-	/* 4: O_NONBLOCK read returns EAGAIN when empty */
-	if (subscription_set_nonblock(sub) < 0)
-		return fail("set nonblock");
-	if (event_read(sub, &count) != -1 || errno != EAGAIN)
-		return fail("nonblocking read of an empty subscription should EAGAIN");
-	printf("ok: O_NONBLOCK read EAGAIN when empty\n");
+	/* 4: read never blocks; an empty subscription reads a count of 0 */
+	if (event_read(sub, &count) != 0 || count != 0)
+		return fail("read of an empty subscription should return count 0");
+	printf("ok: read is non-blocking, empty reads 0\n");
 
-	/* 5: a blocking read wakes on a cross-process signal */
+	/* 5: a poll-driven listener wakes on a cross-process signal */
 	pid = fork();
 	if (pid == 0) {
 		int csub = subscribe_event(evt);
+		struct pollfd p = { .events = POLLIN };
 		uint64_t c = 0;
 
 		if (csub < 0)
 			_exit(2);
+		p.fd = csub;
+		if (poll(&p, 1, 5000) != 1 || !(p.revents & POLLIN))
+			_exit(1);
 		_exit(event_read(csub, &c) == 0 && c >= 1 ? 0 : 1);
 	}
 	sleep(1);
 	signal_event(evt);
 	if (waitpid(pid, &status, 0) < 0 || WEXITSTATUS(status) != 0)
-		return fail("blocked reader should wake and read");
-	printf("ok: blocking read wakes on a cross-process signal\n");
+		return fail("poll-driven listener should wake and read");
+	printf("ok: poll-driven listener wakes on a cross-process signal\n");
 
 	/* 6: closing a subscription detaches it */
 	close_subscription(sub2);

@@ -7,10 +7,11 @@
  * pollable subscription fd (an anon_inode) with its own consumed generation.
  * signal_event() (an ioctl) raises the generation once and wakes every
  * subscription, so one call broadcasts to all of them without the publisher
- * knowing how many there are. A subscription is waited on with
- * poll/epoll/select or read(); read() returns the number of signals since the
- * last read and clears readiness (eventfd-style, but per subscription, so each
- * listener sees every signal). The design lives in ../README.md.
+ * knowing how many there are. A subscription is poll-to-wait, read-to-consume:
+ * you wait on it with poll/epoll/select, and read() never blocks, returning the
+ * number of signals since the last read (possibly 0) and advancing the cursor.
+ * Per subscription, so each listener sees every signal. The design lives in
+ * ../README.md.
  */
 
 #include <linux/anon_inodes.h>
@@ -23,7 +24,6 @@
 #include <linux/module.h>
 #include <linux/poll.h>
 #include <linux/refcount.h>
-#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
@@ -109,6 +109,13 @@ static int signal_event(struct event *evt)
 
 static const struct file_operations subscription_fops;
 
+/*
+ * Consume, never block: this object is poll-to-wait, read-to-consume. Returns
+ * the number of signals since the last read (possibly 0) as a u64, advancing
+ * the cursor. A 0-byte return is reserved for hangup (the event was closed and
+ * nothing is pending), so 8-bytes-with-value-0 ("nothing fired") stays
+ * distinct from EOF.
+ */
 static ssize_t subscription_read(struct file *file, char __user *buf,
 				 size_t count, loff_t *ppos)
 {
@@ -121,27 +128,9 @@ static ssize_t subscription_read(struct file *file, char __user *buf,
 
 	spin_lock_irq(&sub->wqh.lock);
 	cur = (u64)atomic64_read(&evt->gen);
-	if (cur == sub->seen) {
-		if (READ_ONCE(evt->dead)) {
-			spin_unlock_irq(&sub->wqh.lock);
-			return 0; /* source gone, nothing pending: EOF */
-		}
-		if (file->f_flags & O_NONBLOCK) {
-			spin_unlock_irq(&sub->wqh.lock);
-			return -EAGAIN;
-		}
-		if (wait_event_interruptible_exclusive_locked_irq(
-			    sub->wqh,
-			    (u64)atomic64_read(&evt->gen) != sub->seen ||
-				    READ_ONCE(evt->dead))) {
-			spin_unlock_irq(&sub->wqh.lock);
-			return -ERESTARTSYS;
-		}
-		cur = (u64)atomic64_read(&evt->gen);
-		if (cur == sub->seen) { /* woken by hangup, nothing pending */
-			spin_unlock_irq(&sub->wqh.lock);
-			return 0;
-		}
+	if (cur == sub->seen && READ_ONCE(evt->dead)) {
+		spin_unlock_irq(&sub->wqh.lock);
+		return 0; /* source gone, nothing pending: EOF */
 	}
 	cnt = cur - sub->seen;
 	sub->seen = cur;
