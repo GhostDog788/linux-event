@@ -215,24 +215,17 @@ Expected output (wake order varies; all unblock together):
 [first] 2 ready: event0 event2
 ```
 
-## Debugging the demo in VS Code
-
-The lab can build, upload, and source-debug the demo on the target (where
-`/dev/event` lives): run the **"User: Build demo"** task, then **F5** with
-**"User: demo (remote)"**. Its pre-launch task (`scripts/05-debug-user.sh`)
-builds and uploads the demo, loads `event.ko` if `/dev/event` is missing, and
-starts `gdbserver`; the launch attaches host-side gdb. Knobs:
-`USERDEBUG_PORT` (default 2345), `DEMO_ARGS` (listener count). The debugger
-follows the publisher parent; `set follow-fork-mode child` to step a listener.
-
 ## Benchmarking an implementation iteration
 
 `module/event.c` is meant to be iterated on; whether an iteration is better, and
 in which regime, is decided by [`bench/`](bench/), not by eyeballing:
 
 ```bash
-scripts/06-bench.sh server          # run on the target, CSV lands in results/
-python3 code/bench/compare.py results/<baseline>.csv results/<candidate>.csv
+cd bench
+make
+./bench                                   # event vs a futex broadcast control
+./bench -c run.csv -l rev                 # raw samples for compare.py
+python3 compare.py baseline.csv run.csv   # statistical A/B verdict
 ```
 
 `compare.py` prints per-metric medians/p99s with a significance test. Each run
@@ -240,6 +233,16 @@ also measures a **futex broadcast control** (one shared counter, `FUTEX_WAKE`
 wakes all), the kernel-native way to broadcast; if it shifts between runs the
 machine was not quiet and the verdict is void. See
 [`bench/README.md`](bench/README.md).
+
+## Optional: the remote-VM lab
+
+The repo also ships a personal lab harness for developing the module against a
+separate VM target: `scripts/` (provision, build, deploy, kgdb/qemu debug,
+bench), the top-level `Makefile`, and the VS Code tasks/launch configs. It is
+optional and not needed to build, run, or test anything above; copy
+`lab.example.env` to `lab.local.env` and edit it for your machines if you want
+it. With it set up, `scripts/06-bench.sh <target>` runs the bench on the target
+and fetches the CSV, and **F5** in VS Code source-debugs the demo remotely.
 
 ## History
 

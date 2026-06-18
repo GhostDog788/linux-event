@@ -6,9 +6,26 @@ that produces raw samples, and a verdict tool (`compare.py`) that says, with
 statistical backing, whether iteration B beats iteration A, **and in which
 regime**.
 
-## The protocol
+## Quick start
 
-One iteration comparison = two bench runs + one compare:
+With `event.ko` loaded (`cd ../module && make && sudo insmod event.ko`):
+
+```bash
+make
+./bench                                # event vs a futex broadcast control
+./bench -c a.csv -l A                  # capture raw samples
+./bench -c b.csv -l B                  # ...and a second run to compare
+python3 compare.py a.csv b.csv         # the verdict
+./bench -i futex                       # control only: runs with no module loaded
+```
+
+That is all you need. The `## The protocol` and lab references below are for the
+optional remote-VM harness (`scripts/`); skip them if you build and run locally.
+
+## The protocol (optional remote-VM lab)
+
+One iteration comparison = two bench runs + one compare, driven by the lab
+scripts against a configured target (see the top-level README's lab section):
 
 ```bash
 # 1. baseline: build + load the current event.ko, run the bench
