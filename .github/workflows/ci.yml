@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  userspace:
+    name: userspace (build + abi-check + bench smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Build tests, example, bench (includes the ABI drift guard)
+        run: |
+          make -C code/test
+          make -C code/example
+          make -C code/bench
+      - name: Bench control smoke + compare.py (futex, no module needed)
+        run: |
+          cd code/bench
+          ./bench -i futex -s wake,signal0 -N 1,16 -r 20 -c a.csv -l A
+          ./bench -i futex -s wake,signal0 -N 1,16 -r 20 -c b.csv -l B
+          python3 compare.py a.csv b.csv
+
+  module:
+    name: module (build event.ko)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kernel headers + toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic
+      - name: Build event.ko against the generic kernel headers
+        run: |
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -1)
+          echo "Building against $KDIR"
+          test -n "$KDIR" || { echo "no linux-headers-*-generic found"; exit 1; }
+          make -C code/module KDIR="$KDIR"
+
+# Note: loading event.ko and running selftest / broadcast-storm needs root and a
+# matching running kernel, which a stock GitHub runner does not provide. Those
+# functional tests are run locally (and could run on a self-hosted or KVM
+# runner). CI here build-checks the module and exercises the full userspace path.
