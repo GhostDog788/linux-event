@@ -54,11 +54,11 @@ Rules that make the result definitive rather than anecdotal:
 | `wake` | `wake_ns` p50/p99 | latency from "publisher calls signal" to "this waiter is running" | latency-sensitive waiters; **n=1 is the purest single-wake number** |
 | `wake` | `last_wake_ns` | time until the *slowest* of n waiters is running (fan-out completion) | broadcast to many subscribers; exposes the cost of the wake-walk and scheduler pile-up at large n |
 | `wake` | `signal_call_ns` | how long the publisher itself is stuck in `signal_event()` | the publisher has other work to do; exposes O(n) walking under the lock |
-| `churn` | `wakes_per_sec` | sustained subscribers-woken throughput with waiters re-arming flat out | high event rates; exposes register/unregister lock contention |
-| `churn` | `empty_signal_pct` | how often the publisher found nobody parked | diagnostic: high % = waiters re-arm slower than the publisher signals |
-| `churn` | `waiter_wakes` | per-waiter wake counts | fairness: one starved waiter shows up as a low outlier |
-| `loop` | `loop_wake_ns` p50/p99 | signal→listener-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each listener simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; set `-P`/`-W` to your real workload's numbers |
-| `loop` | `missed_signals` | signals that fired while a listener was still working (coalesced into its next wait's generation jump) | listeners running behind the publisher; an edge-triggered design would silently *lose* these events |
+| `churn` | `wakes_per_sec` | sustained throughput, counted subscriber-side (actual wait returns), with subscribers re-arming flat out | high event rates; exposes signal/wait overhead and contention |
+| `churn` | `signal_calls_per_sec` | broadcast signals per second on the publisher | publisher-side cost of one fan-out call |
+| `churn` | `waiter_wakes` | per-subscriber wake counts | fairness: one starved subscriber shows up as a low outlier |
+| `loop` | `loop_wake_ns` p50/p99 | most-recent-signal→subscriber-running latency in the realistic wait→work→re-arm loop (publisher signals every `-P` µs, each subscriber simulates `-W` µs of work) | **the production shape for "many listeners on one event"**; set `-P`/`-W` to your real workload's numbers |
+| `loop` | `missed_signals` | signals that fired while a subscriber was working, coalesced into another read rather than delivered one-for-one (signals-sent minus wait-returns) | subscribers running behind the publisher; an edge-triggered design without `read` draining would lose these |
 | `signal0` | `signal0_ns` | signal cost with zero subscribers | events that are mostly idle ("publish and nobody listens") |
 | `open` | `open_close_ns` | create + destroy cost | short-lived events created per request |
 
@@ -80,31 +80,28 @@ and silently mix the two. Each round therefore:
    `S`; by that point it is registered, because both event.ko and futex
    enqueue *before* marking the task sleeping,
 3. timestamps, signals once, and **checks the signal's return value
-   (waiters woken) equals n**. A short round is released, discarded, and
-   counted in `invalid_rounds`.
+   (subscriptions notified) equals n**. A short round is released, discarded,
+   and counted in `invalid_rounds`.
 
-Step 3 is intentionally implementation-agnostic: if a future iteration
-registers waiters in some way that breaks assumption 2, the round is dropped
-loudly instead of polluting the data. It does rely on the uapi contract that
-`EVENT_IOC_SIGNAL` returns the number of waiters woken; keep that contract
-or teach the harness otherwise.
+Step 3 relies on the uapi contract that `EVENT_IOC_SIGNAL` returns the number
+of subscriptions notified (all of which are parked once the round has gated on
+step 2); keep that contract or teach the harness otherwise.
 
 Other choices worth knowing:
 
-- Waiters are threads, not forked processes (the demo uses fork). The kernel
-  wake path is identical (`wake_up_process` on a task); threads just make
-  cross-waiter timestamps and round barriers cheap and exact.
+- Each subscriber thread owns one subscription to the single shared event and
+  blocks in `read()`; one `signal_event()` wakes them all. Subscribers are
+  threads, not forked processes (the demo uses fork). The kernel wake path is
+  identical (waking tasks on a wait queue); threads just make cross-subscriber
+  timestamps and round barriers cheap and exact.
 - Timestamps are `CLOCK_MONOTONIC`; `wake_ns` includes the signal ioctl's own
   entry cost; that is deliberate: it is the latency the *system* delivers
   from the publisher's decision to the waiter running.
 - The first `max(3, rounds/10)` rounds per combination are warmup and
   discarded.
-- In `churn`, throughput is counted publisher-side from the signal's return
-  value ("parked waiters woken per second"). Per-waiter counts can run
-  higher than that because a waiter that observes the generation move before
-  parking never sleeps; its deliveries don't appear in the signal's return.
-  Compare `wakes_per_sec` across implementations; treat `waiter_wakes` as a
-  fairness signal within one implementation.
+- In `churn`, throughput is counted subscriber-side as the sum of actual wait
+  returns over the window. Compare `wakes_per_sec` across implementations;
+  treat `waiter_wakes` as a fairness signal within one implementation.
 - `-p <cpu>` pins the publisher for steadier `signal_call_ns` numbers; use it
   consistently on both sides of a comparison or not at all.
 

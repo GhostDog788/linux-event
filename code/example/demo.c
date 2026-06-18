@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: MIT
 /*
- * demo.c - demonstrate the event object with many listeners and one sender.
+ * demo.c - broadcast one signal to many listeners, then a k-of-n wait.
  *
- * The program:
- *   1. creates a single event in the parent,
- *   2. clones itself with fork() into N listener children that all
- *      wait_for_event() on the *inherited* fd (same kernel object),
- *   3. acts as the lone sender in the parent: after the listeners have
- *      registered, it signal_event()s once, waking them all at the same time.
+ * Phase 1 (broadcast): the parent creates one event and forks N listeners.
+ * Each listener SUBSCRIBEs the inherited event (getting its own pollable fd)
+ * and blocks. The parent signals once, and *all N* wake. That is the thing a
+ * plain eventfd cannot do: one source fanning out to many independent waiters.
  *
- * Everyone prints to the screen so you can watch the listeners block and then
- * wake together.
+ * Phase 2 (quorum): one process subscribes to several events and waits until
+ * k of them are ready, then sees which fired, all via the kernel's own poll.
  *
  * Build:  make           (see Makefile, pulls in ../lib/event.h)
  * Run:    ./demo [num_listeners]      (default 5; requires event.ko loaded)
@@ -27,41 +25,36 @@
 
 #define DEFAULT_LISTENERS 5
 
-/* Child path: register on the event, block, then report the wake-up. */
+/* Child: subscribe to the shared event, block, report the wake. */
 static int run_listener(int evt, int id)
 {
-	uint64_t gen = 0; /* fresh listener: has seen no signals yet */
+	int sub = subscribe_event(evt);
 
-	printf("  [listener %d | pid %d] waiting for the event...\n", id,
-	       (int)getpid());
-	fflush(stdout);
-
-	if (wait_for_event(evt, &gen, EVT_WAIT_FOREVER) != EVT_SIGNALED) {
-		fprintf(stderr,
-			"  [listener %d | pid %d] wait_for_event failed: %s\n",
+	if (sub < 0) {
+		fprintf(stderr, "  [listener %d | pid %d] subscribe failed: %s\n",
 			id, (int)getpid(), strerror(errno));
 		return 1;
 	}
+	printf("  [listener %d | pid %d] subscribed, waiting...\n", id,
+	       (int)getpid());
+	fflush(stdout);
 
+	if (event_wait(sub, 5000) < 1) {
+		fprintf(stderr, "  [listener %d | pid %d] never woke\n", id,
+			(int)getpid());
+		return 1;
+	}
 	printf("  [listener %d | pid %d] >>> woke up, event received!\n", id,
 	       (int)getpid());
 	fflush(stdout);
+	close_subscription(sub);
 	return 0;
 }
 
-int main(int argc, char **argv)
+static int phase_broadcast(int listeners)
 {
-	int listeners = DEFAULT_LISTENERS;
 	int evt, i, failures = 0;
 	pid_t *kids;
-
-	if (argc > 1) {
-		listeners = atoi(argv[1]);
-		if (listeners < 1) {
-			fprintf(stderr, "num_listeners must be >= 1\n");
-			return 2;
-		}
-	}
 
 	evt = create_event();
 	if (evt < 0) {
@@ -71,10 +64,8 @@ int main(int argc, char **argv)
 			strerror(errno));
 		return 1;
 	}
-	printf("[sender | pid %d] created event (fd %d), spawning %d listeners\n",
-	       (int)getpid(), evt, listeners);
-	/* Flush before fork() so children don't inherit (and re-emit) our
-	 * still-buffered stdout when output is a pipe rather than a tty. */
+	printf("[publisher | pid %d] created event, forking %d listeners\n",
+	       (int)getpid(), listeners);
 	fflush(stdout);
 
 	kids = calloc(listeners, sizeof(*kids));
@@ -84,7 +75,6 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Clone ourselves into N listeners; each inherits the same event fd. */
 	for (i = 0; i < listeners; i++) {
 		pid_t pid = fork();
 
@@ -103,40 +93,82 @@ int main(int argc, char **argv)
 		kids[i] = pid;
 	}
 
-	/*
-	 * Give the listeners a moment to print their "waiting..." line so the
-	 * output reads in order. Purely cosmetic: signals are counted in the
-	 * event's generation, so a listener that calls wait_for_event() only
-	 * after we signal still returns immediately instead of missing it.
-	 */
-	sleep(1);
-
-	printf("[sender | pid %d] signaling the event, waking all listeners\n",
+	sleep(1); /* let the listeners subscribe and block first */
+	printf("[publisher | pid %d] one signal, waking all listeners\n",
 	       (int)getpid());
 	if (signal_event(evt) < 0) {
-		fprintf(stderr, "signal_event failed: %s\n", strerror(errno));
+		perror("signal_event");
 		failures++;
 	}
 
-	/* Reap the listeners and collect their exit status. */
 	for (i = 0; i < listeners; i++) {
 		int status;
 
 		if (kids[i] < 0)
 			continue;
-		if (waitpid(kids[i], &status, 0) < 0) {
-			perror("waitpid");
-			failures++;
-			continue;
-		}
-		if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		if (waitpid(kids[i], &status, 0) < 0 || !WIFEXITED(status) ||
+		    WEXITSTATUS(status) != 0)
 			failures++;
 	}
 
 	close_event(evt);
 	free(kids);
+	return failures;
+}
 
-	printf("[sender | pid %d] done (%d failure%s)\n", (int)getpid(),
-	       failures, failures == 1 ? "" : "s");
+static int phase_quorum(void)
+{
+	int evts[3], subs[3], ready[3], i, n;
+
+	printf("[quorum] subscribing to 3 events, waiting for any 2\n");
+	for (i = 0; i < 3; i++) {
+		evts[i] = create_event();
+		subs[i] = evts[i] < 0 ? -1 : subscribe_event(evts[i]);
+		if (subs[i] < 0) {
+			perror("create/subscribe");
+			return 1;
+		}
+	}
+
+	signal_event(evts[0]);
+	signal_event(evts[2]);
+
+	n = event_wait_quorum(subs, 3, 2, 5000, ready);
+	if (n < 2) {
+		fprintf(stderr, "[quorum] expected >= 2 ready, got %d\n", n);
+		return 1;
+	}
+	printf("[quorum] %d ready:", n);
+	for (i = 0; i < n; i++) {
+		int which = ready[i] == subs[0] ? 0 : ready[i] == subs[1] ? 1 : 2;
+
+		printf(" event%d", which);
+	}
+	printf("\n");
+
+	for (i = 0; i < 3; i++) {
+		close_subscription(subs[i]);
+		close_event(evts[i]);
+	}
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	int listeners = DEFAULT_LISTENERS, failures = 0;
+
+	if (argc > 1) {
+		listeners = atoi(argv[1]);
+		if (listeners < 1) {
+			fprintf(stderr, "num_listeners must be >= 1\n");
+			return 2;
+		}
+	}
+
+	failures += phase_broadcast(listeners);
+	printf("\n");
+	failures += phase_quorum();
+
+	printf("\n[done] %d failure%s\n", failures, failures == 1 ? "" : "s");
 	return failures ? 1 : 0;
 }

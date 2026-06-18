@@ -1,74 +1,49 @@
 // SPDX-License-Identifier: MIT
 /*
- * bench.c - performance harness for the event object (/dev/event).
+ * bench.c - performance harness for the broadcast event (/dev/event).
  *
- * The point of this program is *comparability*: event.ko will go through many
- * implementation iterations, and we want a definitive answer to "is the new
- * one better, and in which regime?". So the harness
+ * The point is comparability: event.ko will go through implementation
+ * iterations, and we want a definitive answer to "is the new one better, and in
+ * which regime?". The shape is broadcast: one event, N subscriptions, and one
+ * signal_event() wakes all of them. So the harness
  *
- *   - measures the handful of numbers that actually distinguish event
- *     implementations (see the scenario list below),
- *   - sweeps the waiter count, because "better" usually depends on it
- *     (1 waiter exercises raw wake latency; hundreds exercise the fan-out
- *     walk and lock contention),
- *   - runs every scenario against a *futex generation-counter* baseline as
- *     well. The futex numbers are the experiment's control: the kernel's
- *     native primitive doing the same job, untouched by our module. Between
- *     two runs on the same machine they should not move; if they do, the
- *     machine was not quiet and the event-vs-event comparison is invalid,
- *   - dumps every raw sample to CSV (-c) so compare.py can attach
- *     percentiles and a significance test to the A/B verdict.
+ *   - measures the numbers that distinguish implementations (below),
+ *   - sweeps the subscriber count (1 = raw wake latency; hundreds = fan-out),
+ *   - runs every scenario against a *futex* control: one shared counter,
+ *     FUTEX_WAKE wakes all waiters, the kernel-native way to broadcast, which
+ *     anchors what the hardware can do and catches a noisy machine,
+ *   - dumps raw samples to CSV (-c) for compare.py.
  *
- * Scenarios (-s, comma list, default all):
+ * Each waiter owns a subscription to the one shared event and blocks in read();
+ * the publisher signals the event once to wake them all. Scenarios (-s):
  *
- *   wake     One publisher signals N parked waiters, -r rounds per N.
- *            Metrics per round: wake_ns (one sample per waiter: time from
- *            just-before-signal to that waiter running again), last_wake_ns
- *            (time until the *slowest* waiter is running, fan-out
- *            completion), signal_call_ns (how long the publisher is stuck
- *            inside signal_event() itself).
+ *   wake     N subscribers parked; the publisher signals once, -r rounds.
+ *            wake_ns (per subscriber: signal to running), last_wake_ns (until
+ *            the slowest), signal_call_ns (publisher time inside signal_event).
  *
- *   churn    N waiters re-arm in a tight loop while the publisher signals
- *            as fast as it can for -d seconds: sustained throughput and
- *            lock contention. Metrics per rep: wakes_per_sec,
- *            signal_calls_per_sec, empty_signal_pct (publisher found no
- *            one waiting, how fast waiters re-arm), waiter_wakes (one
- *            sample per waiter: fairness of the wake distribution).
+ *   churn    N subscribers re-arm flat out while the publisher signals flat out
+ *            for -d seconds. wakes_per_sec (waiter-side), signal_calls_per_sec,
+ *            waiter_wakes (fairness).
  *
- *   loop     The realistic subscriber loop: N waiters each wait, simulate
- *            -W us of work, and re-arm; the publisher signals every -P us
- *            for -d seconds. Metrics: loop_wake_ns (per caught signal: time
- *            from the signal to that waiter running), missed_signals (per
- *            waiter: signals that fired while it was still working --
- *            coalesced into the next wait's generation jump, never lost),
- *            signals_sent.
+ *   loop     N subscribers wait -> work -W us -> re-arm; publisher signals every
+ *            -P us for -d seconds. loop_wake_ns, missed_signals (fired while
+ *            working, coalesced = sent - caught), signals_sent.
  *
- *   signal0  signal cost when nobody is waiting (publish to no
- *            subscribers), batched. Metric: signal0_ns.
+ *   signal0  signal cost with nobody subscribed, batched. signal0_ns.
  *
- *   open     create_event()+close_event() pair cost, batched. Event impl
- *            only. Metric: open_close_ns.
+ *   open     create+destroy of the event, batched. open_close_ns (event only).
  *
- * Validity: a wake round only measures wake latency if every waiter is
- * parked in the kernel before the signal (a waiter that returned instantly
- * off the generation counter measures nothing). The harness guarantees that
- * twice over:
- *   1. the publisher polls /proc/self/task/<tid>/stat until every waiter
- *      thread reports state 'S' (by then it is registered: both event.ko and
- *      futex enqueue *before* marking the task sleeping), and
- *   2. it checks that the signal's return value (waiters woken) == N.
- * A round failing (2) is discarded and counted; a nonzero invalid_rounds in
- * the summary means the implementation under test has a registration race --
- * that is a correctness verdict, not noise.
+ * Validity: a wake round only counts if every subscriber is parked before the
+ * signal. The publisher polls /proc/self/task/<tid>/stat until each is in state
+ * 'S', then signals and checks signal_event()'s return (subscriptions notified)
+ * == N; a short round is discarded into invalid_rounds.
  *
  * Build:  make            (header-only API from ../lib, plus -pthread)
  * Run:    ./bench [-i event,futex] [-s wake,churn,loop,signal0,open]
  *                 [-N 1,2,4,16,64,256] [-r rounds] [-d secs] [-R reps]
- *                 [-P period_us] [-W work_us] [-c out.csv] [-l label]
- *                 [-p cpu]
+ *                 [-P period_us] [-W work_us] [-c out.csv] [-l label] [-p cpu]
  *
- * The event scenarios need /dev/event (event.ko loaded) on this machine;
- * `-i futex` alone runs anywhere, which is handy for testing the harness.
+ * The event scenarios need /dev/event (event.ko loaded); -i futex runs anywhere.
  */
 
 #define _GNU_SOURCE
@@ -93,12 +68,8 @@
 #include "event.h"
 
 #define NSEC_PER_SEC 1000000000ull
-
-/* How long the publisher waits for stragglers before declaring the
- * implementation under test broken (lost waiter / deadlock). */
 #define STUCK_TIMEOUT_NS (10 * NSEC_PER_SEC)
-
-#define WAITER_STACK_SIZE (256 * 1024) /* keep 512 threads cheap on small VMs */
+#define WAITER_STACK_SIZE (256 * 1024)
 
 static void die(const char *fmt, ...)
 {
@@ -159,7 +130,6 @@ static int cmp_double(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-/* Nearest-rank percentile; sorts the vector in place. */
 static double vec_pct(struct vec *s, double p)
 {
 	size_t idx;
@@ -196,15 +166,8 @@ static void csv_emit(const char *scenario, const char *impl, int waiters,
 			waiters, round, metric, value);
 }
 
-/* --- /proc task-state gating ------------------------------------------------
- *
- * State is the field after the last ')' of the comm in
- * /proc/self/task/<tid>/stat. 'S' (interruptible sleep) for one of our waiter
- * threads, which between announcing readiness and blocking executes nothing
- * that sleeps, means it has entered the implementation's wait path and is
- * registered (both event.ko and futex enqueue before marking the task
- * sleeping).
- */
+/* --- /proc task-state gating ----------------------------------------------- */
+
 static char task_state(pid_t tid)
 {
 	char path[64], buf[256];
@@ -245,12 +208,12 @@ static void wait_all_parked(const pid_t *tids, int n, const char *who)
 
 /* --- implementations under test --------------------------------------------
  *
- * Both share one shape, mirroring the event ABI: wait(&gen) returns once
- * the object has been signaled past *gen, immediately if it already has,
- * else by parking, and writes the current generation back; signal_all()
- * wakes everyone and returns how many were parked. A waiter that carries
- * its gen between calls can never lose a signal, which is also what makes
- * the harness race-free by construction.
+ * Broadcast shape: one shared object, signal_all() wakes everyone. wait() is
+ * per-thread. For the event, each thread owns a subscription to the one shared
+ * event (created lazily, closed by a TLS destructor so a sweep does not leak
+ * fds) and blocks in read(); signal_all() is one signal_event() that wakes all
+ * subscriptions. For the futex control, all threads share one counter and
+ * signal_all() is one FUTEX_WAKE(INT_MAX).
  */
 
 struct ctx {
@@ -260,15 +223,48 @@ struct ctx {
 
 struct impl {
 	const char *name;
-	bool has_open; /* supports the open (create/destroy) scenario */
+	bool has_open;
 	void (*setup)(struct ctx *c);
 	void (*teardown)(struct ctx *c);
-	void (*wait)(struct ctx *c, uint64_t *gen);
+	void (*wait)(struct ctx *c);
 	int (*signal_all)(struct ctx *c);
 };
 
-/* event: the object under test, driven through the public ../lib/event.h API
- * exactly the way an application would use it. */
+/* event */
+
+static pthread_key_t event_sub_key;
+static pthread_once_t event_key_once = PTHREAD_ONCE_INIT;
+
+static void event_sub_dtor(void *p)
+{
+	int sub = (int)(intptr_t)p;
+
+	if (sub > 0)
+		close_subscription(sub);
+}
+
+static void event_key_init(void)
+{
+	if (pthread_key_create(&event_sub_key, event_sub_dtor))
+		die("pthread_key_create");
+}
+
+static int event_thread_sub(struct ctx *c)
+{
+	intptr_t sub;
+
+	pthread_once(&event_key_once, event_key_init);
+	sub = (intptr_t)pthread_getspecific(event_sub_key);
+	if (!sub) {
+		int fd = subscribe_event(c->fd);
+
+		if (fd < 0)
+			die("subscribe_event: %s", strerror(errno));
+		sub = fd;
+		pthread_setspecific(event_sub_key, (void *)sub);
+	}
+	return (int)sub;
+}
 
 static void event_setup(struct ctx *c)
 {
@@ -282,10 +278,13 @@ static void event_teardown(struct ctx *c)
 	close_event(c->fd);
 }
 
-static void event_wait_op(struct ctx *c, uint64_t *gen)
+static void event_wait_op(struct ctx *c)
 {
-	if (wait_for_event(c->fd, gen, EVT_WAIT_FOREVER) != EVT_SIGNALED)
-		die("wait_for_event: %s", strerror(errno));
+	int sub = event_thread_sub(c);
+	uint64_t cnt;
+
+	if (read(sub, &cnt, sizeof(cnt)) != (ssize_t)sizeof(cnt))
+		die("subscription read: %s", strerror(errno));
 }
 
 static int event_signal_all(struct ctx *c)
@@ -297,12 +296,7 @@ static int event_signal_all(struct ctx *c)
 	return woken;
 }
 
-/* futex: the control. A 32-bit generation counter; waiters FUTEX_WAIT while
- * the word still equals the generation they carry (EAGAIN = it moved before
- * they parked = a caught signal), the publisher bumps it and FUTEX_WAKEs
- * everyone. This is the kernel-native way to build the same object, so it
- * anchors what the hardware + scheduler can do. The bench never runs long
- * enough to wrap 32 bits. */
+/* futex: one shared counter; FUTEX_WAKE broadcasts. */
 
 static long sys_futex(_Atomic uint32_t *uaddr, int op, uint32_t val)
 {
@@ -319,18 +313,18 @@ static void futex_teardown(struct ctx *c)
 	(void)c;
 }
 
-static void futex_wait_op(struct ctx *c, uint64_t *gen)
+static void futex_wait_op(struct ctx *c)
 {
+	static __thread uint32_t my_gen;
 	uint32_t cur;
 
-	while ((cur = atomic_load(&c->futex_gen)) == (uint32_t)*gen) {
-		long ret = sys_futex(&c->futex_gen, FUTEX_WAIT_PRIVATE,
-				     (uint32_t)*gen);
+	while ((cur = atomic_load(&c->futex_gen)) == my_gen) {
+		long ret = sys_futex(&c->futex_gen, FUTEX_WAIT_PRIVATE, my_gen);
 
 		if (ret < 0 && errno != EAGAIN && errno != EINTR)
 			die("futex_wait: %s", strerror(errno));
 	}
-	*gen = cur;
+	my_gen = cur;
 }
 
 static int futex_signal_all(struct ctx *c)
@@ -380,21 +374,14 @@ static pthread_t spawn_waiter(void *(*fn)(void *), void *arg)
 	return t;
 }
 
-/* --- scenario: wake (fan-out latency) --------------------------------------
- *
- * Per round: all waiters park (publisher verifies, see header comment), the
- * publisher timestamps, signals once, and every waiter timestamps the moment
- * it is running again. Round boundaries are pthread barriers that include
- * the publisher, so per-round state can be reset without races.
- */
+/* --- scenario: wake (broadcast fan-out latency) ---------------------------- */
 
 struct wake_shared {
 	const struct impl *impl;
 	struct ctx *ctx;
-	pthread_barrier_t start, done; /* both have n + 1 parties */
+	pthread_barrier_t start, done; /* n + 1 parties */
 	_Atomic int ready;
 	_Atomic bool quit;
-	uint64_t cur_gen; /* publisher's signal count; written between rounds */
 	pid_t *tids;
 	uint64_t *wake_ts;
 	int n;
@@ -409,7 +396,6 @@ static void *wake_waiter(void *p)
 {
 	struct wake_waiter_arg *a = p;
 	struct wake_shared *sh = a->sh;
-	uint64_t gen;
 
 	sh->tids[a->idx] = (pid_t)syscall(SYS_gettid);
 
@@ -417,13 +403,10 @@ static void *wake_waiter(void *p)
 		pthread_barrier_wait(&sh->start);
 		if (atomic_load(&sh->quit))
 			break;
-		/* Adopt the publisher's generation so this wait really
-		 * parks (a stale gen would return immediately and the
-		 * round would measure nothing). Plain read is fine: the
-		 * publisher wrote it before the start barrier. */
-		gen = sh->cur_gen;
+		/* Each waiter carries its own consumed state, so a fresh round
+		 * has nothing pending and this wait really parks. */
 		atomic_fetch_add(&sh->ready, 1);
-		sh->impl->wait(sh->ctx, &gen);
+		sh->impl->wait(sh->ctx);
 		sh->wake_ts[a->idx] = now_ns();
 		pthread_barrier_wait(&sh->done);
 	}
@@ -456,15 +439,15 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 	}
 
 	for (r = 0; r < warmup + rounds; r++) {
-		uint64_t t0, t1, spin_deadline;
+		uint64_t t0, t1, deadline, slowest = 0;
 		bool valid;
 		int woken;
 
 		pthread_barrier_wait(&sh.start);
 
-		spin_deadline = now_ns() + STUCK_TIMEOUT_NS;
+		deadline = now_ns() + STUCK_TIMEOUT_NS;
 		while (atomic_load(&sh.ready) < n) {
-			if (now_ns() > spin_deadline)
+			if (now_ns() > deadline)
 				die("wake/%s n=%d: waiters never became ready",
 				    impl->name, n);
 			relax();
@@ -474,19 +457,14 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 		t0 = now_ns();
 		woken = impl->signal_all(sh.ctx);
 		t1 = now_ns();
-		sh.cur_gen++;
 
-		/* The parked check above should make woken == n always; if
-		 * not, the impl has a registration race. Release the
-		 * stragglers so the barrier passes, then drop the round. */
 		valid = (woken == n);
 		while (woken < n) {
-			if (now_ns() > spin_deadline)
-				die("wake/%s n=%d round %d: only %d/%d woken "
-				    "and stragglers won't wake: lost waiter",
+			if (now_ns() > deadline)
+				die("wake/%s n=%d round %d: only %d/%d woken: "
+				    "lost waiter",
 				    impl->name, n, r, woken, n);
 			woken += impl->signal_all(sh.ctx);
-			sh.cur_gen++;
 			sched_yield();
 		}
 
@@ -503,7 +481,6 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 		vec_push(&sig, (double)(t1 - t0));
 		csv_emit("wake", impl->name, n, r - warmup, "signal_call_ns",
 			 (double)(t1 - t0));
-		uint64_t slowest = 0;
 		for (i = 0; i < n; i++) {
 			uint64_t lat = sh.wake_ts[i] - t0;
 
@@ -530,8 +507,8 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 	       vec_pct(&wake, 99) / 1e3, vec_pct(&last, 50) / 1e3,
 	       vec_pct(&sig, 50) / 1e3);
 	if (invalid)
-		printf("        ^^^ %d invalid round%s: signal woke fewer "
-		       "waiters than were parked, registration race?\n",
+		printf("        ^^^ %d invalid round%s: signal notified fewer "
+		       "than were parked\n",
 		       invalid, invalid == 1 ? "" : "s");
 	csv_emit("wake", impl->name, n, -1, "invalid_rounds", invalid);
 
@@ -547,24 +524,17 @@ static void run_wake(const struct impl *impl, int n, int rounds, int warmup)
 	impl->teardown(&ctx);
 }
 
-/* --- scenario: churn (sustained throughput under contention) ---------------
- *
- * No round gating here, waiters re-arm as fast as they can and the
- * publisher signals as fast as it can, which is exactly the registration /
- * signal lock contention we want to stress. Throughput is counted on the
- * publisher side from signal_all()'s return value, over the timed window
- * only. Per-waiter counts include at most one extra drain wake each.
- */
+/* --- scenario: churn (sustained throughput) -------------------------------- */
 
 struct churn_count {
 	_Atomic uint64_t c;
-	char pad[64 - sizeof(_Atomic uint64_t)]; /* avoid false sharing */
+	char pad[64 - sizeof(_Atomic uint64_t)];
 };
 
 struct churn_shared {
 	const struct impl *impl;
 	struct ctx *ctx;
-	pthread_barrier_t start; /* n + 1 parties */
+	pthread_barrier_t start;
 	_Atomic bool stop;
 	_Atomic int exited;
 	struct churn_count *counts;
@@ -580,21 +550,24 @@ static void *churn_waiter(void *p)
 {
 	struct churn_waiter_arg *a = p;
 	struct churn_shared *sh = a->sh;
-	uint64_t gen = 0;
+
+	/* Force the subscription to exist before the barrier so the publisher
+	 * never signals into an empty event during the timed window. */
+	if (sh->impl->wait == event_wait_op)
+		(void)event_thread_sub(sh->ctx);
 
 	pthread_barrier_wait(&sh->start);
 	for (;;) {
 		if (atomic_load(&sh->stop))
 			break;
-		sh->impl->wait(sh->ctx, &gen);
+		sh->impl->wait(sh->ctx);
 		atomic_fetch_add(&sh->counts[a->idx].c, 1);
 	}
 	atomic_fetch_add(&sh->exited, 1);
 	return NULL;
 }
 
-static void run_churn(const struct impl *impl, int n, double dur_secs,
-		      int reps)
+static void run_churn(const struct impl *impl, int n, double dur_secs, int reps)
 {
 	int rep, i;
 
@@ -604,9 +577,9 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 		pthread_t *threads;
 		struct ctx ctx;
 		uint64_t t0, t1, t_end, drain_deadline;
-		uint64_t woken = 0, calls = 0, empty = 0;
+		uint64_t total_wakes = 0, calls = 0;
 		uint64_t min_wakes = UINT64_MAX, max_wakes = 0;
-		double elapsed, wps, cps, empty_pct;
+		double elapsed, wps, cps;
 
 		impl->setup(&ctx);
 		sh.ctx = &ctx;
@@ -627,20 +600,15 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 		t0 = now_ns();
 		t_end = t0 + (uint64_t)(dur_secs * NSEC_PER_SEC);
 		while ((t1 = now_ns()) < t_end) {
-			int w = impl->signal_all(sh.ctx);
-
-			woken += (uint64_t)w;
+			impl->signal_all(sh.ctx);
 			calls++;
-			if (!w)
-				empty++;
 		}
 
 		atomic_store(&sh.stop, true);
 		drain_deadline = now_ns() + STUCK_TIMEOUT_NS;
 		while (atomic_load(&sh.exited) < n) {
 			if (now_ns() > drain_deadline)
-				die("churn/%s n=%d: waiters won't drain, "
-				    "lost wakeup in the implementation?",
+				die("churn/%s n=%d: waiters won't drain",
 				    impl->name, n);
 			impl->signal_all(sh.ctx);
 			usleep(100);
@@ -648,15 +616,10 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 		for (i = 0; i < n; i++)
 			pthread_join(threads[i], NULL);
 
-		elapsed = (double)(t1 - t0) / (double)NSEC_PER_SEC;
-		wps = (double)woken / elapsed;
-		cps = (double)calls / elapsed;
-		empty_pct = calls ? 100.0 * (double)empty / (double)calls :
-				    0.0;
-
 		for (i = 0; i < n; i++) {
 			uint64_t c = atomic_load(&sh.counts[i].c);
 
+			total_wakes += c;
 			if (c < min_wakes)
 				min_wakes = c;
 			if (c > max_wakes)
@@ -664,16 +627,16 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 			csv_emit("churn", impl->name, n, rep, "waiter_wakes",
 				 (double)c);
 		}
+		elapsed = (double)(t1 - t0) / (double)NSEC_PER_SEC;
+		wps = (double)total_wakes / elapsed;
+		cps = (double)calls / elapsed;
 		csv_emit("churn", impl->name, n, rep, "wakes_per_sec", wps);
 		csv_emit("churn", impl->name, n, rep, "signal_calls_per_sec",
 			 cps);
-		csv_emit("churn", impl->name, n, rep, "empty_signal_pct",
-			 empty_pct);
 
 		printf("churn   %-6s n=%-4d rep=%d  %10.0f wakes/s  "
-		       "%10.0f signals/s  empty=%5.1f%%  "
-		       "fairness min/max=%llu/%llu\n",
-		       impl->name, n, rep, wps, cps, empty_pct,
+		       "%10.0f signals/s  fairness min/max=%llu/%llu\n",
+		       impl->name, n, rep, wps, cps,
 		       (unsigned long long)min_wakes,
 		       (unsigned long long)max_wakes);
 
@@ -685,33 +648,15 @@ static void run_churn(const struct impl *impl, int n, double dur_secs,
 	}
 }
 
-/* --- scenario: loop (the realistic subscriber loop) -------------------------
- *
- * N waiters: wait -> simulate work -> re-arm, forever. One publisher
- * signals on a fixed period. This is the production shape for "many
- * listeners on one event": the generation guarantees a listener that was
- * still working when a signal fired sees it on the next call instead of
- * sleeping into the void, and the bench counts exactly how often that
- * happened (missed_signals, with an edge-triggered design every one of
- * those would be a silently lost event).
- *
- * Latency accounting: the publisher stamps each generation g in a ring just
- * before signaling; a waiter whose wait returned generation prev+1 was
- * parked when that signal fired, so (now - ring[g]) is true wake latency.
- * A jump (gen > prev+1) means the waiter worked through >= 1 signal: the
- * skipped ones count as missed, and no latency sample is taken (the waiter
- * wasn't waiting, there is nothing to time).
- */
-
-#define LOOP_RING 65536 /* power of two; >> any realistic lag in signals */
+/* --- scenario: loop (the realistic subscriber loop) ------------------------ */
 
 struct loop_shared {
 	const struct impl *impl;
 	struct ctx *ctx;
-	pthread_barrier_t start; /* n + 1 parties */
+	pthread_barrier_t start;
 	_Atomic bool stop;
 	_Atomic int exited;
-	uint64_t *ring; /* signal timestamps, indexed by generation */
+	_Atomic uint64_t last_signal_ts;
 	uint64_t work_ns;
 	int n;
 };
@@ -719,32 +664,29 @@ struct loop_shared {
 struct loop_waiter_arg {
 	struct loop_shared *sh;
 	struct vec lat;
-	uint64_t caught, missed;
+	uint64_t caught;
 };
 
 static void *loop_waiter(void *p)
 {
 	struct loop_waiter_arg *a = p;
 	struct loop_shared *sh = a->sh;
-	uint64_t gen = 0, prev, t;
+	uint64_t t;
+
+	if (sh->impl->wait == event_wait_op)
+		(void)event_thread_sub(sh->ctx);
 
 	pthread_barrier_wait(&sh->start);
 	for (;;) {
-		prev = gen;
-		sh->impl->wait(sh->ctx, &gen);
+		sh->impl->wait(sh->ctx);
 		if (atomic_load(&sh->stop))
 			break;
 		t = now_ns();
-		if (gen == prev + 1) {
-			vec_push(&a->lat,
-				 (double)(t - sh->ring[gen % LOOP_RING]));
-			a->caught++;
-		} else {
-			a->missed += gen - prev - 1;
-			a->caught++; /* the latest one was still delivered */
-		}
+		vec_push(&a->lat,
+			 (double)(t - atomic_load(&sh->last_signal_ts)));
+		a->caught++;
 		while (sh->work_ns && now_ns() < t + sh->work_ns)
-			relax(); /* simulate the listener's work */
+			relax();
 	}
 	atomic_fetch_add(&sh->exited, 1);
 	return NULL;
@@ -761,15 +703,14 @@ static void run_loop(const struct impl *impl, int n, double dur_secs,
 	struct ctx ctx;
 	struct vec lat = { 0 };
 	uint64_t t_end, t_next, g = 0, drain_deadline;
-	uint64_t caught = 0, missed = 0;
+	uint64_t caught = 0, missed;
 	int i;
 
 	impl->setup(&ctx);
 	sh.ctx = &ctx;
-	sh.ring = calloc(LOOP_RING, sizeof(*sh.ring));
 	threads = calloc(n, sizeof(*threads));
 	args = calloc(n, sizeof(*args));
-	if (!sh.ring || !threads || !args)
+	if (!threads || !args)
 		die("out of memory");
 	pthread_barrier_init(&sh.start, NULL, n + 1);
 
@@ -785,7 +726,7 @@ static void run_loop(const struct impl *impl, int n, double dur_secs,
 		struct timespec ts;
 
 		g++;
-		sh.ring[g % LOOP_RING] = now_ns();
+		atomic_store(&sh.last_signal_ts, now_ns());
 		impl->signal_all(sh.ctx);
 
 		t_next += period_us * 1000;
@@ -798,8 +739,7 @@ static void run_loop(const struct impl *impl, int n, double dur_secs,
 	drain_deadline = now_ns() + STUCK_TIMEOUT_NS;
 	while (atomic_load(&sh.exited) < n) {
 		if (now_ns() > drain_deadline)
-			die("loop/%s n=%d: waiters won't drain", impl->name,
-			    n);
+			die("loop/%s n=%d: waiters won't drain", impl->name, n);
 		impl->signal_all(sh.ctx);
 		usleep(1000);
 	}
@@ -808,18 +748,19 @@ static void run_loop(const struct impl *impl, int n, double dur_secs,
 
 	for (i = 0; i < n; i++) {
 		size_t s;
+		uint64_t miss_i = g > args[i].caught ? g - args[i].caught : 0;
 
 		caught += args[i].caught;
-		missed += args[i].missed;
 		for (s = 0; s < args[i].lat.n; s++) {
 			vec_push(&lat, args[i].lat.v[s]);
 			csv_emit("loop", impl->name, n, i, "loop_wake_ns",
 				 args[i].lat.v[s]);
 		}
 		csv_emit("loop", impl->name, n, i, "missed_signals",
-			 (double)args[i].missed);
+			 (double)miss_i);
 		vec_reset(&args[i].lat);
 	}
+	missed = (uint64_t)g * n > caught ? (uint64_t)g * n - caught : 0;
 	csv_emit("loop", impl->name, n, -1, "signals_sent", (double)g);
 
 	printf("loop    %-6s n=%-4d period=%lluus work=%lluus  "
@@ -830,17 +771,15 @@ static void run_loop(const struct impl *impl, int n, double dur_secs,
 	       vec_pct(&lat, 50) / 1e3, vec_pct(&lat, 99) / 1e3,
 	       (unsigned long long)missed,
 	       g && n ? 100.0 * (double)missed / ((double)g * n) : 0.0);
-	(void)caught;
 
 	pthread_barrier_destroy(&sh.start);
 	vec_reset(&lat);
-	free(sh.ring);
 	free(threads);
 	free(args);
 	impl->teardown(&ctx);
 }
 
-/* --- scenario: signal0 (publish with no subscribers) ------------------------ */
+/* --- scenario: signal0 (signal with nobody subscribed) --------------------- */
 
 #define BATCH_OPS 1000
 #define BATCHES 200
@@ -870,7 +809,7 @@ static void run_signal0(const struct impl *impl)
 	vec_reset(&s);
 }
 
-/* --- scenario: open (create/destroy cost) ----------------------------------- */
+/* --- scenario: open (create/destroy cost) ---------------------------------- */
 
 static void run_open(const struct impl *impl)
 {
@@ -946,11 +885,10 @@ static void usage(const char *argv0)
 		"usage: %s [options]\n"
 		"  -i list   implementations: event,futex (default both)\n"
 		"  -s list   scenarios: wake,churn,loop,signal0,open (default all)\n"
-		"  -N list   waiter counts to sweep (default 1,2,4,16,64,256)\n"
-		"  -r n      wake rounds per waiter count (default 100)\n"
+		"  -N list   subscriber counts to sweep (default 1,2,4,16,64,256)\n"
+		"  -r n      wake rounds per count (default 100)\n"
 		"  -d secs   churn/loop duration per rep (default 1.0)\n"
-		"  -R n      churn reps per waiter count (default 10; fewer\n"
-		"            than 8 is too thin for compare.py's verdict)\n"
+		"  -R n      churn reps per count (default 10)\n"
 		"  -P us     loop: publisher signal period (default 2000)\n"
 		"  -W us     loop: per-waiter simulated work (default 0)\n"
 		"  -c file   write raw samples as CSV (for compare.py)\n"
@@ -1036,8 +974,7 @@ int main(int argc, char **argv)
 			die("open %s: %s", csv_path, strerror(errno));
 		fprintf(csv, "# kernel %s, %ld cpus online\n", uts.release,
 			sysconf(_SC_NPROCESSORS_ONLN));
-		fprintf(csv,
-			"label,scenario,impl,waiters,round,metric,value\n");
+		fprintf(csv, "label,scenario,impl,waiters,round,metric,value\n");
 	}
 
 	for (ii = 0; ii < sizeof(impls) / sizeof(impls[0]); ii++) {
