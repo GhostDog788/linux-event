@@ -5,7 +5,7 @@
 # Phases:
 #   1. Best-effort kill of any local gdb holding the debug-endpoint TCP
 #      port (KGDB serial bridge and QEMU gdbstub each serve one client).
-#   2. Upload module/<name>.ko, verify size matches.
+#   2. Upload the built <name>.ko, verify size matches.
 #   3. Insmod; poll /sys/module/<name>/sections/ for runtime addresses,
 #      stage a section-relocated copy of the .ko, and add-symbol-file it.
 #   4. Emit .gdb/<target>-<method>.gdb (+ -attached variant) and the
@@ -67,7 +67,7 @@ fi
 
 artifact_dir="$repo_root/build/artifacts/$target/$kernel"
 intermediate_dir="$repo_root/build/intermediate/$target/$kernel"
-module_dir="$repo_root/module"
+module_dir="$repo_root/code/module"
 
 mapfile -t artifacts < <(find "$artifact_dir" -maxdepth 1 -name '*.ko' -type f | sort)
 case ${#artifacts[@]} in
@@ -76,7 +76,7 @@ case ${#artifacts[@]} in
 	*)
 		echo "expected one .ko under $artifact_dir; found:" >&2
 		printf '  %s\n' "${artifacts[@]}" >&2
-		die "the lab assumes a single obj-m per build. Merge into one module (obj-m += foo.o; foo-y := a.o b.o ...) or split into separate module/ trees."
+		die "the lab assumes a single obj-m per build. Merge into one module (obj-m += foo.o; foo-y := a.o b.o ...) or build them as separate modules."
 		;;
 esac
 artifact="${artifacts[0]}"

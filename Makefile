@@ -1,14 +1,14 @@
-# Top-level wrapper for the user's module under module/.
+# Top-level wrapper for the event.ko project under code/module/.
 #
 # Builds out-of-tree against a target-specific kernel header tree under
 # kernel-cache/<target>/. Sources are staged into
 # build/intermediate/<target>/<kernel>/ before Kbuild runs from there,
 # and `-ffile-prefix-map=$(INTERMEDIATE_DIR)=$(MODULE_DIR)` is injected
-# via KCFLAGS so DWARF paths and `__FILE__` resolve back to module/ —
+# via KCFLAGS so DWARF paths and `__FILE__` resolve back to code/module/ —
 # IDE breakpoints keyed by absolute path bind to the real sources.
 #
 # Per-target staging also keeps each (target, kernel) pair's object
-# files isolated. The user's module/Makefile stays a normal Kbuild file
+# files isolated. The code/module/Makefile stays a normal Kbuild file
 # with no knowledge of the staging.
 
 HOST_KERNEL    := $(shell uname -r)
@@ -21,12 +21,12 @@ BUILD_ID         ?= $(CURRENT_TARGET)/$(CURRENT_KERNEL)
 BUILD_ROOT       ?= $(CURDIR)/build
 INTERMEDIATE_DIR ?= $(BUILD_ROOT)/intermediate/$(BUILD_ID)
 ARTIFACT_DIR     ?= $(BUILD_ROOT)/artifacts/$(BUILD_ID)
-MODULE_DIR       ?= $(CURDIR)/module
+MODULE_DIR       ?= $(CURDIR)/code/module
 
 EXTRA_CCFLAGS  ?= -g -DDEBUG
 KCFLAGS_INJECT := -ffile-prefix-map=$(INTERMEDIATE_DIR)=$(MODULE_DIR) $(EXTRA_CCFLAGS)
 
-.PHONY: all modules prepare-build clean help use-example clean-module
+.PHONY: all modules prepare-build clean help
 
 all: modules
 
@@ -37,13 +37,9 @@ help:
 	@echo "KDIR, BUILD_ID, INTERMEDIATE_DIR, and ARTIFACT_DIR per-target."
 	@echo ""
 	@echo "Build targets:"
-	@echo "  modules                          build module/ against KDIR (default)"
+	@echo "  modules                          build code/module against KDIR (default)"
 	@echo "  clean                            remove BUILD_ID's intermediate + artifact dirs"
-	@echo "  prepare-build                    stage module/ into INTERMEDIATE_DIR (internal)"
-	@echo ""
-	@echo "module/ ergonomics:"
-	@echo "  use-example NAME=chuck_norise    copy an example into module/"
-	@echo "  clean-module                     reset module/ to just README.md"
+	@echo "  prepare-build                    stage code/module into INTERMEDIATE_DIR (internal)"
 	@echo ""
 	@echo "Vars (auto-resolved when kernel-cache/current points at a target):"
 	@echo "  MODULE_DIR        $(MODULE_DIR)"
@@ -53,33 +49,6 @@ help:
 	@echo "  ARTIFACT_DIR      $(ARTIFACT_DIR)"
 	@echo "  EXTRA_CCFLAGS     $(EXTRA_CCFLAGS)  (appended to KCFLAGS)"
 
-# Copy examples/$(NAME)/ into module/. Refuses if module/ already has a
-# Makefile/Kbuild (run clean-module first). Preserves the placeholder
-# module/README.md so the example's own README doesn't overwrite it.
-NAME ?= chuck_norise
-use-example:
-	@if [ ! -d "$(CURDIR)/examples/$(NAME)" ]; then \
-		echo "Makefile: examples/$(NAME) does not exist;" >&2; \
-		echo "  available examples:" >&2; \
-		ls $(CURDIR)/examples 2>/dev/null | sed 's/^/    /' >&2; \
-		exit 1; \
-	fi
-	@if [ -f "$(MODULE_DIR)/Makefile" ] || [ -f "$(MODULE_DIR)/Kbuild" ]; then \
-		echo "Makefile: $(MODULE_DIR) already has a Makefile/Kbuild." >&2; \
-		echo "  Run 'make clean-module' first if you want to replace it." >&2; \
-		exit 1; \
-	fi
-	@echo "copying examples/$(NAME)/* -> $(MODULE_DIR)/  (keeping module/README.md placeholder)"
-	@find "$(CURDIR)/examples/$(NAME)" -mindepth 1 -maxdepth 1 -not -name README.md \
-		-exec cp -r {} "$(MODULE_DIR)/" \;
-	@echo "done. next: scripts/03-build-module.sh <target>"
-	@echo "(the example's docs stay at examples/$(NAME)/README.md)"
-
-clean-module:
-	@[ -d "$(MODULE_DIR)" ] || { echo "Makefile: $(MODULE_DIR) is missing." >&2; exit 1; }
-	@find "$(MODULE_DIR)" -mindepth 1 -maxdepth 1 -not -name README.md -print0 \
-		| xargs -0 -r rm -rf
-	@echo "module/ reset (kept only README.md)"
 
 modules: prepare-build
 	$(MAKE) -C "$(KDIR)" M="$(INTERMEDIATE_DIR)" KCFLAGS="$(KCFLAGS_INJECT)" modules
@@ -103,8 +72,7 @@ modules: prepare-build
 prepare-build:
 	@if [ ! -e "$(MODULE_DIR)/Makefile" ] && [ ! -e "$(MODULE_DIR)/Kbuild" ]; then \
 		echo "Makefile: no Makefile or Kbuild under $(MODULE_DIR);" >&2; \
-		echo "  drop your kernel module project there (see $(MODULE_DIR)/README.md)" >&2; \
-		echo "  or try the example: make use-example NAME=chuck_norise" >&2; \
+		echo "  this lab builds the event.ko project at code/module (see code/README.md)" >&2; \
 		exit 1; \
 	fi
 	@cp --help 2>&1 | grep -q -- '--symbolic-link' || { \

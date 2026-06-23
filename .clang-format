@@ -1,0 +1,10 @@
+BasedOnStyle: LLVM
+# Remove excessive newlines (keeps at most 2 empty lines)
+MaxEmptyLinesToKeep: 2
+# Strict Linux Kernel formatting rules
+UseTab: Always
+IndentWidth: 8
+TabWidth: 8
+BreakBeforeBraces: Linux
+AllowShortIfStatementsOnASingleLine: false
+IndentCaseLabels: false

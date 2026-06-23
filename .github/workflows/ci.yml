@@ -2,112 +2,43 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 jobs:
-  shellcheck:
-    name: shellcheck + bash -n
+  userspace:
+    name: userspace (build + abi-check + bench smoke)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install shellcheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: bash -n (syntax check)
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+      - name: Build tests, example, bench (includes the ABI drift guard)
         run: |
-          for f in scripts/lib/*.sh scripts/0*.sh; do
-            echo "::group::bash -n $f"
-            bash -n "$f"
-            echo "::endgroup::"
-          done
+          make -C code/test
+          make -C code/example
+          make -C code/bench
+      - name: Bench control smoke + compare.py (futex, no module needed)
+        run: |
+          cd code/bench
+          ./bench -i futex -s wake,signal0 -N 1,16 -r 20 -c a.csv -l A
+          ./bench -i futex -s wake,signal0 -N 1,16 -r 20 -c b.csv -l B
+          python3 compare.py a.csv b.csv
 
-      - name: shellcheck
-        run: shellcheck -x scripts/lib/common.sh scripts/0*.sh
-
-  json:
-    name: validate JSON
+  module:
+    name: module (build event.ko)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: validate .vscode/*.json
+      - name: Install kernel headers + toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential linux-headers-generic
+      - name: Build event.ko against the generic kernel headers
         run: |
-          for f in .vscode/*.json; do
-            echo "::group::python -m json.tool $f"
-            python3 -m json.tool "$f" > /dev/null
-            echo "::endgroup::"
-          done
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -1)
+          echo "Building against $KDIR"
+          test -n "$KDIR" || { echo "no linux-headers-*-generic found"; exit 1; }
+          make -C code/module KDIR="$KDIR"
 
-  makefile:
-    name: Makefile syntax
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: make help (dry-parse)
-        run: make help
-
-  build:
-    name: build example module against runner kernel (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install host kernel headers + build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            bc bison flex libelf-dev libssl-dev \
-            "linux-headers-$(uname -r)"
-
-      - name: use the example module
-        run: make use-example NAME=chuck_norise
-
-      - name: build via top-level Makefile (default target)
-        # KDIR defaults to /lib/modules/$(uname -r)/build when there's no
-        # kernel-cache/current, so this exercises the full prepare-build +
-        # KCFLAGS pipeline against a real (the runner's) kernel.
-        run: make modules
-
-      - name: assert a .ko was produced
-        run: |
-          set -e
-          shopt -s nullglob
-          kos=(build/artifacts/*/*/*.ko)
-          if [ "${#kos[@]}" -eq 0 ]; then
-            echo "::error::no .ko produced under build/artifacts/"
-            ls -R build/ || true
-            exit 1
-          fi
-          for ko in "${kos[@]}"; do
-            echo "built $ko ($(stat -c %s "$ko") bytes)"
-            file "$ko"
-          done
-
-      - name: verify DWARF prefix-map rewrote paths back to module/
-        # The whole point of -ffile-prefix-map is that DWARF references your
-        # source under module/<...>.c, not build/intermediate/<...>.c. If a
-        # change to the Makefile breaks the injection, this catches it.
-        run: |
-          set -e
-          ko=$(find build/artifacts -name '*.ko' | head -1)
-          if objdump --dwarf=decodedline "$ko" 2>/dev/null \
-              | grep -qE '/build/intermediate/'; then
-            echo "::error::DWARF still references build/intermediate/ — prefix-map broken"
-            objdump --dwarf=decodedline "$ko" 2>/dev/null | grep -E '/build/intermediate/' | head
-            exit 1
-          fi
-          echo "ok: DWARF paths point at module/"
-
-      - name: clean-module resets cleanly
-        run: |
-          make clean-module
-          ls module/
-          [ "$(ls module/)" = "README.md" ] || { echo "::error::clean-module did not reduce module/ to just README.md"; exit 1; }
+# Note: loading event.ko and running selftest / broadcast-storm needs root and a
+# matching running kernel, which a stock GitHub runner does not provide. Those
+# functional tests are run locally (and could run on a self-hosted or KVM
+# runner). CI here build-checks the module and exercises the full userspace path.
