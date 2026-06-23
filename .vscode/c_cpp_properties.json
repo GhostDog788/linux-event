@@ -2,7 +2,7 @@
   "version": 4,
   "configurations": [
     {
-      "name": "Linux kernel module - current",
+      "name": "event.ko (kernel module)",
       "compilerPath": "/usr/bin/gcc",
       "intelliSenseMode": "linux-gcc-x64",
       "cStandard": "gnu11",
@@ -10,12 +10,13 @@
         "__KERNEL__",
         "MODULE",
         "CC_USING_FENTRY",
-        "KBUILD_MODNAME=\"kmod\"",
-        "KBUILD_BASENAME=\"kmod\"",
-        "__KBUILD_MODNAME=kmod_kmod"
+        "KBUILD_MODNAME=\"event\"",
+        "KBUILD_BASENAME=\"event\"",
+        "__KBUILD_MODNAME=kmod_event"
       ],
       "includePath": [
-        "${workspaceFolder}/module/**",
+        "${workspaceFolder}/code/module/**",
+        "${workspaceFolder}/code/lib",
         "${workspaceFolder}/kernel-cache/current/build/include",
         "${workspaceFolder}/kernel-cache/current/build/include/uapi",
         "${workspaceFolder}/kernel-cache/current/build/include/generated",
@@ -28,7 +29,8 @@
       ],
       "browse": {
         "path": [
-          "${workspaceFolder}/module",
+          "${workspaceFolder}/code/module",
+          "${workspaceFolder}/code/lib",
           "${workspaceFolder}/kernel-cache/current/source",
           "${workspaceFolder}/kernel-cache/current/build/ubuntu/include",
           "${workspaceFolder}/kernel-cache/current/build/include",
@@ -40,6 +42,17 @@
         "${workspaceFolder}/kernel-cache/current/build/include/linux/compiler-version.h",
         "${workspaceFolder}/kernel-cache/current/build/include/linux/kconfig.h",
         "${workspaceFolder}/kernel-cache/current/build/include/linux/compiler_types.h"
+      ]
+    },
+    {
+      "name": "event demo (userspace)",
+      "compilerPath": "/usr/bin/gcc",
+      "intelliSenseMode": "linux-gcc-x64",
+      "cStandard": "gnu11",
+      "defines": [],
+      "includePath": [
+        "${workspaceFolder}/code/lib",
+        "${workspaceFolder}/code/example"
       ]
     }
   ]

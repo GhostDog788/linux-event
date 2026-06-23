@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build module/ against the synced headers for <target>.
+# Build code/module against the synced headers for <target>.
 #
-# Delegates to the top-level Makefile, which stages module/ into
+# Delegates to the top-level Makefile, which stages code/module into
 # build/intermediate/<target>/<kernel>/ and runs Kbuild from there with
 # -ffile-prefix-map injected via KCFLAGS. Result: one .ko under
 # build/artifacts/<target>/<kernel>/.
@@ -20,9 +20,9 @@ kdir="$cache_dir/build"
 [[ -f "$kernel_file" && -d "$kdir" ]] ||
 	die "missing kernel cache for $target; run: scripts/02-setup-host-build.sh $target"
 
-module_dir="$repo_root/module"
+module_dir="$repo_root/code/module"
 [[ -e "$module_dir/Makefile" || -e "$module_dir/Kbuild" ]] ||
-	die "no Makefile or Kbuild under $module_dir; drop your module project there (see $module_dir/README.md), or try the example: make use-example NAME=chuck_norise"
+	die "no Makefile or Kbuild under $module_dir; this lab builds the event.ko project (see code/README.md)"
 
 kernel="$(<"$kernel_file")"
 intermediate_dir="$repo_root/build/intermediate/$target/$kernel"

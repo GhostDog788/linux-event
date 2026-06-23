@@ -42,6 +42,26 @@
       "autorun": [
         "source ${workspaceFolder}/.gdb/current-debug-attached.gdb"
       ]
+    },
+    {
+      "name": "User: demo (remote)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/code/example/demo",
+      "cwd": "${workspaceFolder}/code/example",
+      "MIMode": "gdb",
+      "miDebuggerPath": "gdb",
+      "targetArchitecture": "x64",
+      "preLaunchTask": "User: Deploy + gdbserver",
+      "setupCommands": [
+        {
+          "description": "Connect to the gdbserver started on the target by scripts/05",
+          "text": "source ${workspaceFolder}/.gdb/current-user.gdb",
+          "ignoreFailures": false
+        }
+      ],
+      "launchCompleteCommand": "exec-continue",
+      "externalConsole": false
     }
   ]
 }

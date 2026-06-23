@@ -1,68 +1,56 @@
 # Contributing
 
-Bug reports, fixes, and improvements welcome.
+Thanks for taking a look. This is a small project; the bar is "builds clean,
+tests pass, stays readable."
 
-## What belongs here
+## Building and testing
 
-This is a **template** for building and source-debugging out-of-tree
-Linux kernel modules. Lab tooling lives in `Makefile`, `scripts/`,
-`.vscode/`, `host/`. The example under `examples/chuck_norise/`
-demonstrates the workflow end-to-end.
+Everything below runs locally, no remote lab required.
 
-**PRs that belong here:**
+```bash
+# kernel module (needs linux-headers-$(uname -r))
+cd code/module && make
+sudo insmod event.ko          # creates /dev/event
 
-- Bugs in the lab tooling: broken scripts, wrong assumptions, scripts
-  that fail on re-run, unclear errors.
-- New target-OS backends (currently only Ubuntu — see the `TARGET_OS`
-  checks in scripts 01 and 02).
-- New debug methods that fit the `<endpoint> → GDB` shape.
-- Docs fixes.
-- Quality-of-life: better errors, idempotent re-runs, faster sync.
+# functional tests (need the module loaded) + the ABI drift guard
+cd ../test && make
+./selftest
+./broadcast-storm
 
-**PRs that do not belong here**
+# example and benchmark
+cd ../example && make && ./demo 5
+cd ../bench   && make && ./bench
 
-- Changes to `module/` (user's slot; stays as just a placeholder README).
-- New examples under `examples/` (one focused example beats many).
-- Project-management features (work logs, task tracking).
+sudo rmmod event
+```
 
-## Reporting bugs
+`make` in `code/test` also builds `abi-check`, a `-Werror` compile that fails if
+`lib/event.h` and `module/event_uapi.h` drift on the ioctl numbers. Run it
+(or `make` in `code/test`) after changing the ABI in either header.
 
-Open an issue with:
+CI build-checks the module against `linux-headers-generic` and runs the full
+userspace path on every push and PR (`.github/workflows/ci.yml`). The functional
+tests need root and a loaded module, so run those locally before sending a
+change.
 
-- Dev host (distro, version, kernel) and target VM (distro, version,
-  kernel, hypervisor).
-- Debug method tried (`kgdb` or `qemu`) and endpoint configured.
-- Command run and full output. For deploy failures, attach
-  `.gdb/<target>-<method>-loader.log`.
-- What you expected vs what happened.
+## Expectations for a change
 
-## Submitting changes
-
-1. Fork, branch from `main`.
-2. Focused commits — one logical change per commit.
-3. Keep scripts shellcheck-clean and `bash -n`-clean:
-   `shellcheck -x scripts/lib/common.sh scripts/0*.sh` and
-   `for f in scripts/lib/*.sh scripts/0*.sh; do bash -n "$f"; done`.
-4. Update docs in the same PR — if you touched a script, check
-   `README.md` and `module/README.md` for anything the change made
-   inaccurate.
-5. PR description explains *why*, not just what.
+- The module loads and `selftest` + `broadcast-storm` pass, with a clean
+  `dmesg` (no WARN/oops) across load/run/`rmmod`.
+- If you touched the ioctl ABI, update both headers; `abi-check` must still
+  compile.
+- If you touched `module/event.c`, the bench should show no surprising
+  regression versus the futex control (`compare.py`).
 
 ## Style
 
-- **Shell:** tabs for indent. `set -euo pipefail` at the top. Errors via
-  the `die` helper. Use `lab_*` helpers from `scripts/lib/common.sh` —
-  don't call ssh/scp/sshpass binaries directly from numbered scripts.
-- **Makefile:** tabs for recipes; explicit `.PHONY`.
-- **Markdown:** wrap at ~80; fenced code blocks with language tags.
-- **JSON / YAML:** 2-space indent, trailing newline.
+- C is formatted with the kernel style in `.clang-format`; `.editorconfig`
+  covers the rest. Match the surrounding code.
+- Keep code comments short; deeper design rationale belongs in `code/README.md`
+  or `code/MECHANISM.md`.
 
-`.editorconfig` captures these — most editors apply it automatically.
+## The optional lab
 
-## Testing locally
-
-No automated test suite for the build/debug flow (it needs real VMs).
-Before sending a PR, smoke-test the full chain against at least one
-target VM: `01 --debug-symbols` → reboot → `02` → `03` → `04` → F5 in
-VS Code → set breakpoints in both your module and a kernel function,
-confirm both bind.
+`scripts/`, the top-level `Makefile`, and `.vscode/` are a personal harness for
+developing the module against a separate VM. It is optional and unnecessary for
+the workflow above; see the lab section in `code/README.md` if you want it.

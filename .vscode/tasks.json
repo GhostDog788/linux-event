@@ -41,10 +41,7 @@
       "label": "Kernel: Build",
       "type": "shell",
       "command": "./scripts/03-build-module.sh ${input:kernelTarget}",
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
+      "group": "build",
       "problemMatcher": []
     },
     {
@@ -64,6 +61,22 @@
         "panel": "dedicated",
         "clear": true
       },
+      "problemMatcher": []
+    },
+    {
+      "label": "User: Build demo",
+      "type": "shell",
+      "command": "make",
+      "options": { "cwd": "${workspaceFolder}/code/example" },
+      "group": "build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "User: Deploy + gdbserver",
+      "type": "shell",
+      "command": "./scripts/05-debug-user.sh ${input:kernelTarget}",
+      "dependsOn": ["User: Build demo"],
+      "dependsOrder": "sequence",
       "problemMatcher": []
     }
   ]
